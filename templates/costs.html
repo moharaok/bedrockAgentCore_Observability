@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentCore Observability — Costs</title>
+    <link rel="stylesheet" href="/static/css/landing.css">
+    <link rel="stylesheet" href="/static/css/nav.css">
+    <style>
+        .cost-page { max-width: 1400px; margin: 0 auto; padding: 24px; }
+        .cost-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+        .cost-header h2 { margin: 0; font-size: 1.3rem; color: #2d3748; }
+        .cost-total {
+            font-size: 2rem; font-weight: 700; color: #2b6cb0;
+            background: linear-gradient(135deg, #ebf8ff, #e6fffa);
+            padding: 12px 24px; border-radius: 12px; border: 1px solid #bee3f8;
+        }
+        .dimension-selector {
+            display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap;
+        }
+        .dim-btn {
+            padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 8px;
+            background: white; cursor: pointer; font-size: 0.82rem; transition: all 0.15s;
+        }
+        .dim-btn:hover { border-color: #4299e1; color: #4299e1; }
+        .dim-btn.active { background: #4299e1; color: white; border-color: #4299e1; }
+        .cost-table-container { background: white; border-radius: 12px; border: 1px solid #e2e8f0; overflow: hidden; margin-bottom: 24px; }
+        .cost-table-header {
+            padding: 14px 20px; background: linear-gradient(135deg, #f7fafc, #edf2f7);
+            border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;
+        }
+        .cost-table-header h3 { margin: 0; font-size: 0.95rem; color: #2d3748; }
+        .cost-table-body { overflow-x: auto; }
+        .cost-bar {
+            height: 6px; background: linear-gradient(90deg, #4299e1, #9f7aea);
+            border-radius: 3px; min-width: 4px; transition: width 0.3s;
+        }
+        .grid-3col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+        @media (max-width: 1000px) { .grid-3col { grid-template-columns: 1fr; } }
+        .dim-filter { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; grid-column: 1 / -1; }
+        .dim-filter-btn {
+            padding: 6px 14px; border: 1px solid #e2e8f0; border-radius: 6px;
+            background: white; cursor: pointer; font-size: 0.78rem; transition: all 0.15s;
+        }
+        .dim-filter-btn:hover { border-color: #4299e1; color: #4299e1; }
+        .dim-filter-btn.active { background: #4299e1; color: white; border-color: #4299e1; }
+        .dim-card { background: white; border-radius: 10px; border: 1px solid #e2e8f0; padding: 16px; }
+        .dim-card h4 { margin: 0 0 12px; font-size: 0.85rem; color: #4a5568; }
+        .dim-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #f7fafc; font-size: 0.8rem; }
+        .dim-item:last-child { border-bottom: none; }
+        .dim-item .name { color: #2d3748; font-weight: 500; }
+        .dim-item .cost { color: #2b6cb0; font-weight: 600; font-family: 'SF Mono', monospace; }
+        .dim-row { background: #f7fafc; padding: 10px 16px !important; }
+        .agent-dim-section { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+        .agent-dim-section:last-child { margin-bottom: 0; }
+        .dim-label { font-size: 0.7rem; color: #718096; font-weight: 600; text-transform: uppercase; min-width: 60px; }
+        .dim-tag {
+            font-size: 0.72rem; background: white; border: 1px solid #e2e8f0;
+            padding: 2px 8px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px;
+        }
+        .dim-cost { color: #2b6cb0; font-weight: 600; font-family: 'SF Mono', monospace; font-size: 0.68rem; }
+    </style>
+</head>
+<body>
+    <header class="top-bar">
+        <div class="brand"><div class="brand-icon">🔍</div> AgentCore Observability</div>
+        <nav class="nav-links">
+            <a href="/"><span class="nav-icon">📊</span> Overview</a>
+            <a href="/agents"><span class="nav-icon">🤖</span> Agents</a>
+            <a href="/costs" class="active"><span class="nav-icon">💰</span> Costs</a>
+            <a href="/settings"><span class="nav-icon">⚙️</span> Settings</a>
+        </nav>
+        <div class="time-control">
+            <select id="timeRange" onchange="loadCosts()">
+                <option value="3600">Last 1 Hour</option>
+                <option value="21600">Last 6 Hours</option>
+                <option value="86400">Last 24 Hours</option>
+                <option value="604800" selected>Last 7 Days</option>
+                <option value="2592000">Last 30 Days</option>
+            </select>
+            <button onclick="loadCosts()">↻</button>
+        </div>
+    </header>
+
+    <main class="cost-page">
+        <div id="loading" class="loading-overlay">
+            <div class="spinner"></div><span>Loading cost data...</span>
+        </div>
+
+        <div class="cost-header">
+            <h2>💰 Cost Analysis</h2>
+            <div class="cost-total" id="totalCost">$0.00</div>
+        </div>
+
+        <!-- Dimension filters -->
+        <div class="dimension-selector">
+            <button class="dim-btn active" onclick="showView('agent')">By Agent</button>
+            <button class="dim-btn" onclick="showView('model')">By Model</button>
+            <button class="dim-btn" onclick="showView('region')">By Region</button>
+            <button class="dim-btn" onclick="showView('session_dim')">By Session Dimension</button>
+            <button class="dim-btn" onclick="showView('session')">By Session</button>
+        </div>
+
+        <!-- Session dimension cards -->
+        <div id="sessionDimCards" style="display:none; margin-bottom: 24px;"></div>
+
+        <!-- Main cost table -->
+        <div class="cost-table-container">
+            <div class="cost-table-header">
+                <h3 id="tableTitle">Cost by Agent</h3>
+                <span id="tableCount" style="font-size:0.8rem;color:#718096"></span>
+            </div>
+            <div class="cost-table-body" id="costTableBody"></div>
+        </div>
+    </main>
+
+    <script>
+        let costData = null;
+        let currentView = 'agent';
+
+        async function loadCosts() {
+            const seconds = document.getElementById("timeRange").value;
+            document.getElementById("loading").style.display = "flex";
+
+            try {
+                const res = await fetch(`/api/costs?seconds=${seconds}`);
+                costData = await res.json();
+                if (costData.error) throw new Error(costData.error);
+                document.getElementById("totalCost").textContent = `$${costData.total_cost.toFixed(4)}`;
+                showView(currentView);
+            } catch (err) {
+                document.getElementById("costTableBody").innerHTML = `<div class="error" style="padding:20px">${err.message}</div>`;
+            } finally {
+                document.getElementById("loading").style.display = "none";
+            }
+        }
+
+        function showView(view) {
+            currentView = view;
+            document.querySelectorAll('.dim-btn').forEach(b => b.classList.remove('active'));
+            event?.target?.classList.add('active');
+            document.getElementById("sessionDimCards").style.display = "none";
+
+            switch(view) {
+                case 'agent': renderByAgent(); break;
+                case 'model': renderByModel(); break;
+                case 'region': renderByRegion(); break;
+                case 'session_dim': renderBySessionDim(); break;
+                case 'session': renderBySession(); break;
+            }
+        }
+
+        function renderByAgent() {
+            const data = costData.by_agent;
+            const sorted = Object.entries(data).sort((a, b) => b[1].cost - a[1].cost);
+            const maxCost = sorted.length > 0 ? sorted[0][1].cost : 1;
+
+            document.getElementById("tableTitle").textContent = "Cost by Agent";
+            document.getElementById("tableCount").textContent = `${sorted.length} agents`;
+            document.getElementById("costTableBody").innerHTML = `
+                <table>
+                    <thead><tr><th>Agent</th><th>Models</th><th>Sessions</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th><th></th></tr></thead>
+                    <tbody>
+                        ${sorted.map(([name, d]) => {
+                            const dims = d.dimensions || {};
+                            const dimHtml = Object.entries(dims).map(([dimName, values]) => {
+                                const sortedVals = Object.entries(values).sort((a, b) => b[1].cost - a[1].cost);
+                                return `<div class="agent-dim-section">
+                                    <span class="dim-label">${dimName}:</span>
+                                    ${sortedVals.map(([val, info]) => `<span class="dim-tag">${val} <span class="dim-cost">$${info.cost.toFixed(4)}</span></span>`).join('')}
+                                </div>`;
+                            }).join('');
+
+                            return `
+                                <tr>
+                                    <td><strong>${name}</strong></td>
+                                    <td style="font-size:0.72rem;color:#718096">${d.models.map(m => m.split(':')[0].split('.').pop()).join(', ')}</td>
+                                    <td class="center">${d.sessions}</td>
+                                    <td class="center">${d.calls}</td>
+                                    <td class="right">${formatNumber(d.input_tokens)}</td>
+                                    <td class="right">${formatNumber(d.output_tokens)}</td>
+                                    <td class="right"><strong>$${d.cost.toFixed(4)}</strong></td>
+                                    <td style="width:100px"><div class="cost-bar" style="width:${(d.cost/maxCost)*100}%"></div></td>
+                                </tr>
+                                ${dimHtml ? `<tr><td colspan="8" class="dim-row">${dimHtml}</td></tr>` : ''}
+                            `;
+                        }).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function renderByModel() {
+            const data = costData.by_model;
+            const sorted = Object.entries(data).sort((a, b) => b[1].cost - a[1].cost);
+            const maxCost = sorted.length > 0 ? sorted[0][1].cost : 1;
+
+            document.getElementById("tableTitle").textContent = "Cost by Model";
+            document.getElementById("tableCount").textContent = `${sorted.length} models`;
+            document.getElementById("costTableBody").innerHTML = `
+                <table>
+                    <thead><tr><th>Model</th><th>Agents</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>$/1K In</th><th>$/1K Out</th><th>Cost</th><th></th></tr></thead>
+                    <tbody>
+                        ${sorted.map(([name, d]) => `
+                            <tr>
+                                <td><strong>${name.split(':')[0]}</strong></td>
+                                <td style="font-size:0.72rem;color:#718096">${d.agents.join(', ')}</td>
+                                <td class="center">${d.calls}</td>
+                                <td class="right">${formatNumber(d.input_tokens)}</td>
+                                <td class="right">${formatNumber(d.output_tokens)}</td>
+                                <td class="right" style="font-size:0.72rem">$${d.pricing.input}</td>
+                                <td class="right" style="font-size:0.72rem">$${d.pricing.output}</td>
+                                <td class="right"><strong>$${d.cost.toFixed(4)}</strong></td>
+                                <td style="width:80px"><div class="cost-bar" style="width:${(d.cost/maxCost)*100}%"></div></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function renderByRegion() {
+            const data = costData.by_region;
+            const sorted = Object.entries(data).sort((a, b) => b[1].cost - a[1].cost);
+
+            document.getElementById("tableTitle").textContent = "Cost by Region";
+            document.getElementById("tableCount").textContent = `${sorted.length} regions`;
+            document.getElementById("costTableBody").innerHTML = `
+                <table>
+                    <thead><tr><th>Region</th><th>Agents</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th></tr></thead>
+                    <tbody>
+                        ${sorted.map(([name, d]) => `
+                            <tr>
+                                <td><strong>${name}</strong></td>
+                                <td style="font-size:0.72rem;color:#718096">${d.agents.join(', ')}</td>
+                                <td class="center">${d.calls}</td>
+                                <td class="right">${formatNumber(d.input_tokens)}</td>
+                                <td class="right">${formatNumber(d.output_tokens)}</td>
+                                <td class="right"><strong>$${d.cost.toFixed(4)}</strong></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function renderBySessionDim() {
+            const data = costData.by_session_dimension;
+            const entries = Object.entries(data);
+
+            // Group by dimension name
+            const grouped = {};
+            for (const [key, d] of entries) {
+                const dim = d.dimension;
+                if (!grouped[dim]) grouped[dim] = [];
+                grouped[dim].push(d);
+            }
+
+            // Show dimension filter buttons
+            const dimNames = Object.keys(grouped).sort();
+            const filterHtml = `
+                <div class="dim-filter">
+                    <button class="dim-filter-btn active" onclick="filterDimension(null)">All</button>
+                    ${dimNames.map(d => `<button class="dim-filter-btn" onclick="filterDimension('${d}')">${d}</button>`).join('')}
+                </div>
+            `;
+
+            // Show cards
+            const cardsEl = document.getElementById("sessionDimCards");
+            cardsEl.style.display = "grid";
+            cardsEl.innerHTML = filterHtml + `<div id="dimCardsContent" class="grid-3col" style="grid-column:1/-1">${renderDimCards(grouped, null)}</div>`;
+
+            // Also show table
+            renderDimTable(entries, null);
+        }
+
+        function filterDimension(selectedDim) {
+            // Update active button
+            document.querySelectorAll('.dim-filter-btn').forEach(b => {
+                b.classList.toggle('active', 
+                    (selectedDim === null && b.textContent === 'All') || b.textContent === selectedDim
+                );
+            });
+
+            const data = costData.by_session_dimension;
+            const entries = Object.entries(data);
+            const grouped = {};
+            for (const [key, d] of entries) {
+                const dim = d.dimension;
+                if (!grouped[dim]) grouped[dim] = [];
+                grouped[dim].push(d);
+            }
+
+            document.getElementById("dimCardsContent").innerHTML = renderDimCards(grouped, selectedDim);
+            renderDimTable(entries, selectedDim);
+        }
+
+        function renderDimCards(grouped, selectedDim) {
+            const filteredGroups = selectedDim 
+                ? {[selectedDim]: grouped[selectedDim] || []} 
+                : grouped;
+
+            return Object.entries(filteredGroups).map(([dimName, items]) => {
+                const sorted = items.sort((a, b) => b.cost - a.cost);
+                return `
+                    <div class="dim-card">
+                        <h4>📁 ${dimName}</h4>
+                        ${sorted.map(d => `
+                            <div class="dim-item">
+                                <div>
+                                    <span class="name">${d.value}</span>
+                                    <div style="font-size:0.68rem;color:#718096;margin-top:2px">
+                                        ${d.agents.length ? `<span>🤖 ${d.agents.join(', ')}</span>` : ''}
+                                        ${d.models.length ? `<span style="margin-left:6px">🧠 ${d.models.map(m => m.split(':')[0].split('.').pop()).join(', ')}</span>` : ''}
+                                    </div>
+                                </div>
+                                <span class="cost">$${d.cost.toFixed(4)}</span>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderDimTable(entries, selectedDim) {
+            const filtered = selectedDim 
+                ? entries.filter(([key, d]) => d.dimension === selectedDim)
+                : entries;
+            const sorted = filtered.sort((a, b) => b[1].cost - a[1].cost);
+            const maxCost = sorted.length > 0 ? sorted[0][1].cost : 1;
+
+            document.getElementById("tableTitle").textContent = selectedDim 
+                ? `Cost by ${selectedDim}` 
+                : "Cost by Session Dimension";
+            document.getElementById("tableCount").textContent = selectedDim
+                ? `Showing ${sorted.length} values for ${selectedDim}`
+                : `Session IDs split by "_" → all dimensions`;
+            document.getElementById("costTableBody").innerHTML = `
+                <table>
+                    <thead><tr><th>Dimension</th><th>Value</th><th>Agents</th><th>Models</th><th>Sessions</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th><th></th></tr></thead>
+                    <tbody>
+                        ${sorted.map(([key, d]) => `
+                            <tr>
+                                <td style="font-size:0.75rem;color:#718096">${d.dimension}</td>
+                                <td><strong>${d.value}</strong></td>
+                                <td style="font-size:0.72rem;color:#4a5568">${(d.agents || []).join(', ')}</td>
+                                <td style="font-size:0.72rem;color:#718096">${(d.models || []).map(m => m.split(':')[0].split('.').pop()).join(', ')}</td>
+                                <td class="center">${d.sessions}</td>
+                                <td class="center">${d.calls}</td>
+                                <td class="right">${formatNumber(d.input_tokens)}</td>
+                                <td class="right">${formatNumber(d.output_tokens)}</td>
+                                <td class="right"><strong>$${d.cost.toFixed(4)}</strong></td>
+                                <td style="width:80px"><div class="cost-bar" style="width:${(d.cost/maxCost)*100}%"></div></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function renderBySession() {
+            const data = costData.by_session;
+            const sorted = Object.entries(data).sort((a, b) => b[1].cost - a[1].cost);
+            const maxCost = sorted.length > 0 ? sorted[0][1].cost : 1;
+
+            document.getElementById("sessionDimCards").style.display = "none";
+            document.getElementById("tableTitle").textContent = "Cost by Session (Top 50)";
+            document.getElementById("tableCount").textContent = `${sorted.length} sessions`;
+            document.getElementById("costTableBody").innerHTML = `
+                <table>
+                    <thead><tr><th>Session ID</th><th>Agent</th><th>Model</th><th>Calls</th><th>Input</th><th>Output</th><th>Cost</th><th></th></tr></thead>
+                    <tbody>
+                        ${sorted.map(([sid, d]) => `
+                            <tr>
+                                <td style="font-family:monospace;font-size:0.72rem;max-width:250px;overflow:hidden;text-overflow:ellipsis" title="${sid}">${sid}</td>
+                                <td style="font-size:0.78rem">${d.agent}</td>
+                                <td style="font-size:0.72rem;color:#718096">${(d.models || []).map(m => m.split(':')[0].split('.').pop()).join(', ')}</td>
+                                <td class="center">${d.calls}</td>
+                                <td class="right">${formatNumber(d.input_tokens)}</td>
+                                <td class="right">${formatNumber(d.output_tokens)}</td>
+                                <td class="right"><strong>$${d.cost.toFixed(6)}</strong></td>
+                                <td style="width:60px"><div class="cost-bar" style="width:${(d.cost/maxCost)*100}%"></div></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function formatNumber(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+            return n.toString();
+        }
+
+        loadCosts();
+    </script>
+</body>
+</html>

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentCore Observability</title>
+    <link rel="stylesheet" href="/static/css/landing.css">
+    <link rel="stylesheet" href="/static/css/nav.css">
+</head>
+<body>
+    <header class="top-bar">
+        <div class="brand"><div class="brand-icon">🔍</div> AgentCore Observability</div>
+        <nav class="nav-links">
+            <a href="/" class="active"><span class="nav-icon">📊</span> Overview</a>
+            <a href="/agents"><span class="nav-icon">🤖</span> Agents</a>
+            <a href="/costs"><span class="nav-icon">💰</span> Costs</a>
+            <a href="/settings"><span class="nav-icon">⚙️</span> Settings</a>
+        </nav>
+        <div class="time-control">
+            <select id="timeRange" onchange="loadSummary()">
+                <option value="3600">Last 1 Hour</option>
+                <option value="21600">Last 6 Hours</option>
+                <option value="86400" selected>Last 24 Hours</option>
+                <option value="604800">Last 7 Days</option>
+                <option value="2592000">Last 30 Days</option>
+            </select>
+            <button onclick="loadSummary()">↻</button>
+        </div>
+    </header>
+
+    <main class="dashboard">
+        <div id="loading" class="loading-overlay">
+            <div class="spinner"></div>
+            <span>Loading overview...</span>
+        </div>
+
+        <!-- KPI Tiles -->
+        <section class="kpi-section" id="kpiSection"></section>
+
+        <!-- Models & Cost -->
+        <section class="grid-2col">
+            <div class="card" id="modelsCard">
+                <h3>🧠 Models Used</h3>
+                <div class="card-body" id="modelsBody"></div>
+            </div>
+            <div class="card" id="costCard">
+                <h3>💰 Cost Breakdown</h3>
+                <div class="card-body" id="costBody"></div>
+            </div>
+        </section>
+
+        <!-- Active Agents -->
+        <section class="card" id="agentsCard">
+            <h3>📊 Agent Activity</h3>
+            <div class="card-body" id="agentsBody"></div>
+        </section>
+    </main>
+
+    <script>
+        async function loadSummary() {
+            const seconds = document.getElementById("timeRange").value;
+            document.getElementById("loading").style.display = "flex";
+
+            try {
+                const res = await fetch(`/api/summary?seconds=${seconds}`);
+                const data = await res.json();
+                if (data.error) throw new Error(data.error);
+                render(data.summary);
+            } catch (err) {
+                document.getElementById("kpiSection").innerHTML = `<div class="error">Error: ${err.message}</div>`;
+            } finally {
+                document.getElementById("loading").style.display = "none";
+            }
+        }
+
+        function render(s) {
+            // KPI Tiles
+            const totalTokens = s.tokens.total;
+            const costStr = s.cost.total_usd < 0.01 ? `$${s.cost.total_usd.toFixed(4)}` : `$${s.cost.total_usd.toFixed(2)}`;
+            const timeLabel = document.getElementById("timeRange").selectedOptions[0].text;
+
+            document.getElementById("kpiSection").innerHTML = `
+                <div class="kpi-tile">
+                    <div class="kpi-value">${s.agents.total}</div>
+                    <div class="kpi-label">Total Agents</div>
+                    <div class="kpi-sub">${s.agents.http_agents} HTTP | ${s.agents.mcp_servers} MCP</div>
+                </div>
+                <div class="kpi-tile">
+                    <div class="kpi-value">${s.agents.active}</div>
+                    <div class="kpi-label">Active Agents</div>
+                    <div class="kpi-sub">${timeLabel}</div>
+                </div>
+                <div class="kpi-tile">
+                    <div class="kpi-value">${formatNumber(s.tokens.total_input)}</div>
+                    <div class="kpi-label">Input Tokens</div>
+                    <div class="kpi-sub">${timeLabel}</div>
+                </div>
+                <div class="kpi-tile">
+                    <div class="kpi-value">${formatNumber(s.tokens.total_output)}</div>
+                    <div class="kpi-label">Output Tokens</div>
+                    <div class="kpi-sub">${timeLabel}</div>
+                </div>
+                <div class="kpi-tile">
+                    <div class="kpi-value">${formatNumber(totalTokens)}</div>
+                    <div class="kpi-label">Total Tokens</div>
+                    <div class="kpi-sub">${timeLabel}</div>
+                </div>
+                <div class="kpi-tile highlight">
+                    <div class="kpi-value">${costStr}</div>
+                    <div class="kpi-label">Estimated Cost</div>
+                    <div class="kpi-sub">${timeLabel}</div>
+                </div>
+                <div class="kpi-tile">
+                    <div class="kpi-value">${s.models.unique_count}</div>
+                    <div class="kpi-label">Models Used</div>
+                    <div class="kpi-sub">${Object.keys(s.models.by_model).map(m => m.split('.').pop().split('-')[0]).join(', ')}</div>
+                </div>
+                <div class="kpi-tile">
+                    <div class="kpi-value">${Object.keys(s.agents.by_region).length}</div>
+                    <div class="kpi-label">Regions</div>
+                    <div class="kpi-sub">${Object.keys(s.agents.by_region).join(', ')}</div>
+                </div>
+            `;
+
+            // Models table
+            const models = Object.entries(s.models.by_model);
+            if (models.length > 0) {
+                document.getElementById("modelsBody").innerHTML = `
+                    <table>
+                        <thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th></tr></thead>
+                        <tbody>
+                            ${models.map(([m, d]) => `
+                                <tr>
+                                    <td><strong>${m.split(':')[0]}</strong></td>
+                                    <td class="center">${d.calls}</td>
+                                    <td class="right">${formatNumber(d.input_tokens)}</td>
+                                    <td class="right">${formatNumber(d.output_tokens)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } else {
+                document.getElementById("modelsBody").innerHTML = '<p class="empty">No model usage in this time range</p>';
+            }
+
+            // Cost breakdown
+            if (models.length > 0) {
+                document.getElementById("costBody").innerHTML = `
+                    <table>
+                        <thead><tr><th>Model</th><th>Input Cost</th><th>Output Cost</th><th>Total</th></tr></thead>
+                        <tbody>
+                            ${models.map(([m, d]) => `
+                                <tr>
+                                    <td><strong>${m.split(':')[0]}</strong></td>
+                                    <td class="right">$${d.input_cost.toFixed(4)}</td>
+                                    <td class="right">$${d.output_cost.toFixed(4)}</td>
+                                    <td class="right"><strong>$${d.total_cost.toFixed(4)}</strong></td>
+                                </tr>
+                            `).join('')}
+                            <tr class="total-row">
+                                <td><strong>TOTAL</strong></td>
+                                <td></td><td></td>
+                                <td class="right"><strong>${costStr}</strong></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <div class="source">Source: <a href="${s.cost.pricing_source}" target="_blank">${s.cost.pricing_source}</a></div>
+                `;
+            } else {
+                document.getElementById("costBody").innerHTML = '<p class="empty">No cost data available</p>';
+            }
+
+            // Agent activity with cost
+            const agents = Object.entries(s.activity.active_agents).sort((a, b) => b[1].spans - a[1].spans);
+            const costByAgent = s.activity.cost_by_agent || {};
+            if (agents.length > 0) {
+                document.getElementById("agentsBody").innerHTML = `
+                    <table>
+                        <thead><tr><th>Agent</th><th>Model</th><th>Spans</th><th>Input Tokens</th><th>Output Tokens</th><th>Est. Cost</th></tr></thead>
+                        <tbody>
+                            ${agents.map(([name, d]) => {
+                                const agentCost = costByAgent[name] || {};
+                                const costDisplay = agentCost.total_cost ? `$${agentCost.total_cost.toFixed(4)}` : '—';
+                                const models = (agentCost.models || []).map(m => m.split(':')[0].split('.').pop()).join(', ') || '—';
+                                return `
+                                    <tr>
+                                        <td><a href="/agents?agent=${encodeURIComponent(name)}" style="color:#4299e1;text-decoration:none"><strong>${name}</strong></a></td>
+                                        <td style="font-size:0.75rem;color:#718096">${models}</td>
+                                        <td class="center">${d.spans}</td>
+                                        <td class="right">${formatNumber(d.input_tokens)}</td>
+                                        <td class="right">${formatNumber(d.output_tokens)}</td>
+                                        <td class="right"><strong>${costDisplay}</strong></td>
+                                    </tr>
+                                `;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } else {
+                document.getElementById("agentsBody").innerHTML = '<p class="empty">No agent activity in this time range</p>';
+            }
+        }
+
+        function formatNumber(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+            return n.toString();
+        }
+
+        loadSummary();
+    </script>
+</body>
+</html>

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentCore Observability — Settings</title>
+    <link rel="stylesheet" href="/static/css/nav.css">
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa; min-height: 100vh;
+        }
+        .page-content { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 56px); }
+        .setup-container {
+            background: white; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+            max-width: 700px; width: 100%; padding: 40px; margin: 20px;
+        }
+        .setup-header { text-align: center; margin-bottom: 32px; }
+        .setup-header h1 { margin: 0 0 8px; font-size: 1.6rem; color: #1a1a2e; }
+        .setup-header p { margin: 0; color: #718096; font-size: 0.9rem; }
+        .setup-header .logo { font-size: 3rem; margin-bottom: 12px; }
+        .section { margin-bottom: 28px; }
+        .section h3 { margin: 0 0 12px; font-size: 0.95rem; color: #2d3748; display: flex; align-items: center; gap: 8px; }
+        .section h3 .badge { font-size: 0.7rem; background: #e2e8f0; color: #4a5568; padding: 2px 8px; border-radius: 4px; }
+        .form-group { margin-bottom: 14px; }
+        .form-group label { display: block; font-size: 0.8rem; color: #4a5568; margin-bottom: 4px; font-weight: 500; }
+        .form-group input, .form-group textarea {
+            width: 100%; padding: 10px 14px; border: 1px solid #e2e8f0; border-radius: 8px;
+            font-size: 0.85rem; font-family: 'SF Mono', monospace; transition: border-color 0.15s;
+        }
+        .form-group input:focus, .form-group textarea:focus { outline: none; border-color: #4299e1; }
+        .form-group textarea { resize: vertical; min-height: 60px; }
+        .form-group .help { font-size: 0.72rem; color: #a0aec0; margin-top: 4px; }
+        .region-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+        .region-tag {
+            background: #ebf8ff; color: #2b6cb0; padding: 4px 10px; border-radius: 6px;
+            font-size: 0.78rem; display: flex; align-items: center; gap: 4px;
+        }
+        .region-tag .remove { cursor: pointer; font-weight: bold; }
+        .region-tag .remove:hover { color: #c53030; }
+        .add-region { display: flex; gap: 8px; }
+        .add-region input { flex: 1; }
+        .add-region button { padding: 10px 16px; border: none; background: #4299e1; color: white; border-radius: 8px; cursor: pointer; font-size: 0.8rem; }
+        .add-region button:hover { background: #3182ce; }
+        .btn-container { display: flex; gap: 12px; justify-content: flex-end; margin-top: 32px; }
+        .btn {
+            padding: 12px 28px; border: none; border-radius: 8px; font-size: 0.9rem;
+            cursor: pointer; font-weight: 500; transition: all 0.15s;
+        }
+        .btn-primary { background: #4299e1; color: white; }
+        .btn-primary:hover { background: #3182ce; }
+        .btn-secondary { background: #edf2f7; color: #4a5568; }
+        .btn-secondary:hover { background: #e2e8f0; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status { text-align: center; padding: 12px; border-radius: 8px; margin-top: 16px; font-size: 0.85rem; display: none; }
+        .status.success { display: block; background: #c6f6d5; color: #276749; }
+        .status.error { display: block; background: #fed7d7; color: #c53030; }
+        .divider { border: none; border-top: 1px solid #e2e8f0; margin: 24px 0; }
+    </style>
+</head>
+<body>
+    <header class="top-bar">
+        <div class="brand"><div class="brand-icon">🔍</div> AgentCore Observability</div>
+        <nav class="nav-links">
+            <a href="/"><span class="nav-icon">📊</span> Overview</a>
+            <a href="/agents"><span class="nav-icon">🤖</span> Agents</a>
+            <a href="/costs"><span class="nav-icon">💰</span> Costs</a>
+            <a href="/settings" class="active"><span class="nav-icon">⚙️</span> Settings</a>
+        </nav>
+    </header>
+    <div class="page-content">
+    <div class="setup-container">
+        <div class="setup-header">
+            <div class="logo">🔍</div>
+            <h1>AgentCore Observability</h1>
+            <p>Configure your dashboard settings to get started</p>
+        </div>
+
+        <div class="section">
+            <h3>☁️ AWS Regions</h3>
+            <div class="form-group">
+                <label>Regions to monitor for AgentCore agents</label>
+                <div class="region-tags" id="regionTags"></div>
+                <div class="add-region" style="margin-top: 8px">
+                    <input type="text" id="newRegion" placeholder="e.g. us-west-2" onkeydown="if(event.key==='Enter'){addRegion();}">
+                    <button onclick="addRegion()">Add</button>
+                </div>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <div class="section">
+            <h3>📋 CloudWatch Log Groups</h3>
+            <div class="form-group">
+                <label>OpenTelemetry Spans</label>
+                <input type="text" id="lgSpans" value="">
+                <div class="help">Log group containing OTEL span data from agent runtimes</div>
+            </div>
+            <div class="form-group">
+                <label>Model Invocation Logs (with content)</label>
+                <input type="text" id="lgModelInvocation" value="">
+                <div class="help">Log group with full LLM request/response bodies (requires content logging enabled)</div>
+            </div>
+            <div class="form-group">
+                <label>Runtime Logs Prefix</label>
+                <input type="text" id="lgRuntimePrefix" value="">
+                <div class="help">Prefix for agent runtime log groups (agent ID appended automatically)</div>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <div class="section">
+            <h3>💰 Pricing <span class="badge">Optional</span></h3>
+            <div class="form-group">
+                <label>Pricing Source URL</label>
+                <input type="text" id="pricingUrl" value="">
+            </div>
+            <div class="form-group">
+                <label>Last Updated</label>
+                <input type="text" id="pricingDate" value="" readonly>
+                <div class="help">Date when pricing data was last verified</div>
+            </div>
+            <div class="form-group" style="display:flex;gap:8px">
+                <button class="btn btn-secondary" onclick="refreshPricing()" id="refreshPricingBtn">🔄 Fetch from AWS Pricing API</button>
+            </div>
+            <div id="pricingStatus" class="status"></div>
+
+            <div style="margin-top:16px">
+                <h4 style="font-size:0.85rem;color:#4a5568;margin:0 0 10px">Model Pricing Table</h4>
+                <div style="max-height:400px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px">
+                    <table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+                        <thead><tr style="background:#f7fafc;position:sticky;top:0">
+                            <th style="padding:8px 12px;text-align:left">Model ID</th>
+                            <th style="padding:8px 12px;text-align:right">$/1K Input</th>
+                            <th style="padding:8px 12px;text-align:right">$/1K Output</th>
+                            <th style="padding:8px 12px;text-align:center">Actions</th>
+                        </tr></thead>
+                        <tbody id="pricingTableBody"></tbody>
+                    </table>
+                </div>
+                <div style="margin-top:10px;padding:12px;background:#f7fafc;border-radius:8px">
+                    <div style="font-size:0.8rem;font-weight:600;margin-bottom:8px">Add / Update Model</div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap">
+                        <input type="text" id="newModelId" placeholder="Model ID (e.g. us.amazon.nova-2-lite-v1:0)" style="flex:2;padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:0.78rem">
+                        <input type="number" id="newModelInput" placeholder="$/1K input" step="0.00001" style="width:100px;padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:0.78rem">
+                        <input type="number" id="newModelOutput" placeholder="$/1K output" step="0.00001" style="width:100px;padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:0.78rem">
+                        <button onclick="addModelPricing()" style="padding:6px 12px;background:#4299e1;color:white;border:none;border-radius:6px;cursor:pointer;font-size:0.78rem">Add</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="btn-container">
+            <button class="btn btn-secondary" onclick="skipSetup()">Skip (use defaults)</button>
+            <button class="btn btn-primary" id="saveBtn" onclick="saveSettings()">Save & Launch Dashboard</button>
+        </div>
+
+        <div class="status" id="statusMsg"></div>
+    </div>
+    </div><!-- /page-content -->
+
+    <script>
+        let regions = [];
+        let config = {};
+
+        async function init() {
+            const res = await fetch("/api/config");
+            config = await res.json();
+            regions = config.regions || ["us-east-1"];
+            renderRegions();
+            document.getElementById("lgSpans").value = config.log_groups?.spans || "aws/spans";
+            document.getElementById("lgModelInvocation").value = config.log_groups?.model_invocation || "";
+            document.getElementById("lgRuntimePrefix").value = config.log_groups?.runtime_prefix || "/aws/bedrock-agentcore/runtimes";
+            document.getElementById("pricingUrl").value = config.pricing_source || "https://aws.amazon.com/bedrock/pricing/";
+            document.getElementById("pricingDate").value = config.pricing_last_updated || "";
+            await loadPricingTable();
+        }
+
+        function renderRegions() {
+            const container = document.getElementById("regionTags");
+            container.innerHTML = regions.map(r => `
+                <span class="region-tag">${r}<span class="remove" onclick="removeRegion('${r}')">×</span></span>
+            `).join("");
+        }
+
+        function addRegion() {
+            const input = document.getElementById("newRegion");
+            const region = input.value.trim();
+            if (region && !regions.includes(region)) {
+                regions.push(region);
+                renderRegions();
+                input.value = "";
+            }
+        }
+
+        function removeRegion(region) {
+            regions = regions.filter(r => r !== region);
+            renderRegions();
+        }
+
+        async function saveSettings() {
+            const btn = document.getElementById("saveBtn");
+            btn.disabled = true;
+            btn.textContent = "Saving...";
+
+            const payload = {
+                regions: regions,
+                log_groups: {
+                    spans: document.getElementById("lgSpans").value.trim(),
+                    model_invocation: document.getElementById("lgModelInvocation").value.trim(),
+                    runtime_prefix: document.getElementById("lgRuntimePrefix").value.trim(),
+                },
+                pricing: {
+                    source_url: document.getElementById("pricingUrl").value.trim(),
+                    last_updated: document.getElementById("pricingDate").value.trim(),
+                },
+            };
+
+            try {
+                const res = await fetch("/api/config", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (data.status === "ok") {
+                    showStatus("success", "✅ Configuration saved! Redirecting to dashboard...");
+                    setTimeout(() => { window.location.href = "/"; }, 1500);
+                } else {
+                    showStatus("error", "Error: " + (data.error || "Unknown error"));
+                    btn.disabled = false;
+                    btn.textContent = "Save & Launch Dashboard";
+                }
+            } catch (err) {
+                showStatus("error", "Error: " + err.message);
+                btn.disabled = false;
+                btn.textContent = "Save & Launch Dashboard";
+            }
+        }
+
+        function skipSetup() {
+            window.location.href = "/";
+        }
+
+        function showStatus(type, msg) {
+            const el = document.getElementById("statusMsg");
+            el.className = "status " + type;
+            el.textContent = msg;
+        }
+
+        async function loadPricingTable() {
+            const res = await fetch("/api/pricing");
+            const data = await res.json();
+            const models = data.models || {};
+            const tbody = document.getElementById("pricingTableBody");
+            const sorted = Object.entries(models).sort((a, b) => a[0].localeCompare(b[0]));
+            tbody.innerHTML = sorted.map(([id, p]) => `
+                <tr style="border-bottom:1px solid #f0f0f0">
+                    <td style="padding:6px 12px;font-family:monospace;font-size:0.72rem">${id}</td>
+                    <td style="padding:6px 12px;text-align:right">$${p.input_per_1k}</td>
+                    <td style="padding:6px 12px;text-align:right">$${p.output_per_1k}</td>
+                    <td style="padding:6px 12px;text-align:center">
+                        ${id !== '_default' ? `<button onclick="deleteModel('${id}')" style="background:none;border:none;color:#e53e3e;cursor:pointer;font-size:0.8rem" title="Delete">🗑️</button>` : '<span style="color:#a0aec0;font-size:0.7rem">default</span>'}
+                    </td>
+                </tr>
+            `).join('');
+            document.getElementById("pricingDate").value = data.last_updated || "";
+        }
+
+        async function refreshPricing() {
+            const btn = document.getElementById("refreshPricingBtn");
+            btn.disabled = true;
+            btn.textContent = "⏳ Fetching from AWS...";
+            const statusEl = document.getElementById("pricingStatus");
+            statusEl.className = "status";
+            statusEl.style.display = "none";
+
+            try {
+                const res = await fetch("/api/pricing/refresh", { method: "POST" });
+                const data = await res.json();
+                if (data.status === "ok") {
+                    statusEl.className = "status success";
+                    statusEl.textContent = "✅ " + data.message;
+                    statusEl.style.display = "block";
+                    await loadPricingTable();
+                } else {
+                    statusEl.className = "status error";
+                    statusEl.textContent = "❌ " + (data.error || "Unknown error");
+                    statusEl.style.display = "block";
+                }
+            } catch (err) {
+                statusEl.className = "status error";
+                statusEl.textContent = "❌ " + err.message;
+                statusEl.style.display = "block";
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "🔄 Fetch from AWS Pricing API";
+            }
+        }
+
+        async function addModelPricing() {
+            const modelId = document.getElementById("newModelId").value.trim();
+            const inputPrice = document.getElementById("newModelInput").value;
+            const outputPrice = document.getElementById("newModelOutput").value;
+
+            if (!modelId || !inputPrice || !outputPrice) {
+                alert("Please fill in all fields");
+                return;
+            }
+
+            const res = await fetch("/api/pricing/model", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    model_id: modelId,
+                    input_per_1k: parseFloat(inputPrice),
+                    output_per_1k: parseFloat(outputPrice),
+                }),
+            });
+            const data = await res.json();
+            if (data.status === "ok") {
+                document.getElementById("newModelId").value = "";
+                document.getElementById("newModelInput").value = "";
+                document.getElementById("newModelOutput").value = "";
+                await loadPricingTable();
+            } else {
+                alert("Error: " + (data.error || "Unknown error"));
+            }
+        }
+
+        async function deleteModel(modelId) {
+            if (!confirm(`Delete pricing for "${modelId}"?`)) return;
+            const res = await fetch(`/api/pricing/model/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+            const data = await res.json();
+            if (data.status === "ok") {
+                await loadPricingTable();
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>

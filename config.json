@@ -1,0 +1,153 @@
+{
+  "regions": [
+    "us-east-1"
+  ],
+  "log_groups": {
+    "spans": "aws/spans",
+    "model_invocation": "/aws/bedrock/model-invocation-logs-ai-governance-config-packs",
+    "runtime_prefix": "/aws/bedrock-agentcore/runtimes"
+  },
+  "pricing": {
+    "source_url": "https://aws.amazon.com/bedrock/pricing/",
+    "last_updated": "2026-06-07",
+    "models": {
+      "us.amazon.nova-micro-v1:0": {
+        "input_per_1k": 3.5e-05,
+        "output_per_1k": 0.00014
+      },
+      "us.amazon.nova-lite-v1:0": {
+        "input_per_1k": 6e-05,
+        "output_per_1k": 0.00024
+      },
+      "us.amazon.nova-pro-v1:0": {
+        "input_per_1k": 0.00055,
+        "output_per_1k": 0.00048
+      },
+      "us.amazon.nova-premier-v1:0": {
+        "input_per_1k": 0.0025,
+        "output_per_1k": 0.015
+      },
+      "amazon.nova-micro-v1:0": {
+        "input_per_1k": 3.5e-05,
+        "output_per_1k": 0.00014
+      },
+      "amazon.nova-lite-v1:0": {
+        "input_per_1k": 6e-05,
+        "output_per_1k": 0.00024
+      },
+      "amazon.nova-pro-v1:0": {
+        "input_per_1k": 0.0008,
+        "output_per_1k": 0.0032
+      },
+      "us.amazon.nova-2-lite-v1:0": {
+        "input_per_1k": 6e-05,
+        "output_per_1k": 0.00024
+      },
+      "us.amazon.nova-2-pro-v1:0": {
+        "input_per_1k": 0.0008,
+        "output_per_1k": 0.0032
+      },
+      "us.amazon.nova-2-micro-v1:0": {
+        "input_per_1k": 3.5e-05,
+        "output_per_1k": 0.00014
+      },
+      "anthropic.claude-3-haiku-20240307-v1:0": {
+        "input_per_1k": 0.00025,
+        "output_per_1k": 0.00125
+      },
+      "anthropic.claude-3-sonnet-20240229-v1:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "anthropic.claude-3-opus-20240229-v1:0": {
+        "input_per_1k": 0.015,
+        "output_per_1k": 0.075
+      },
+      "anthropic.claude-3-5-sonnet-20240620-v1:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "anthropic.claude-3-5-sonnet-20241022-v2:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "anthropic.claude-3-5-haiku-20241022-v1:0": {
+        "input_per_1k": 0.0008,
+        "output_per_1k": 0.004
+      },
+      "us.anthropic.claude-3-haiku-20240307-v1:0": {
+        "input_per_1k": 0.00025,
+        "output_per_1k": 0.00125
+      },
+      "us.anthropic.claude-3-5-sonnet-20241022-v2:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "us.anthropic.claude-3-5-haiku-20241022-v1:0": {
+        "input_per_1k": 0.0008,
+        "output_per_1k": 0.004
+      },
+      "us.anthropic.claude-sonnet-4-20250514-v1:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "input_per_1k": 0.0008,
+        "output_per_1k": 0.004
+      },
+      "global.anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "input_per_1k": 0.0008,
+        "output_per_1k": 0.004
+      },
+      "meta.llama3-8b-instruct-v1:0": {
+        "input_per_1k": 0.0003,
+        "output_per_1k": 0.0006
+      },
+      "meta.llama3-70b-instruct-v1:0": {
+        "input_per_1k": 0.00265,
+        "output_per_1k": 0.0035
+      },
+      "meta.llama3-1-8b-instruct-v1:0": {
+        "input_per_1k": 0.00022,
+        "output_per_1k": 0.00022
+      },
+      "meta.llama3-1-70b-instruct-v1:0": {
+        "input_per_1k": 0.00072,
+        "output_per_1k": 0.00072
+      },
+      "meta.llama3-1-405b-instruct-v1:0": {
+        "input_per_1k": 0.00195,
+        "output_per_1k": 0.00256
+      },
+      "mistral.mistral-7b-instruct-v0:2": {
+        "input_per_1k": 0.00015,
+        "output_per_1k": 0.0002
+      },
+      "mistral.mixtral-8x7b-instruct-v0:1": {
+        "input_per_1k": 0.00045,
+        "output_per_1k": 0.0007
+      },
+      "mistral.mistral-large-2402-v1:0": {
+        "input_per_1k": 0.004,
+        "output_per_1k": 0.012
+      },
+      "cohere.command-r-v1:0": {
+        "input_per_1k": 0.0005,
+        "output_per_1k": 0.0015
+      },
+      "cohere.command-r-plus-v1:0": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015
+      },
+      "_default": {
+        "input_per_1k": 0.001,
+        "output_per_1k": 0.004
+      }
+    }
+  },
+  "_is_configured": true
+}

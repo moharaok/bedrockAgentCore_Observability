@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentCore Observability — Agents</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/nav.css">
+</head>
+<body>
+    <div id="app" class="dashboard">
+        <header class="top-bar">
+            <div class="brand"><div class="brand-icon">🔍</div> AgentCore Observability</div>
+            <nav class="nav-links">
+                <a href="/"><span class="nav-icon">📊</span> Overview</a>
+                <a href="/agents" class="active"><span class="nav-icon">🤖</span> Agents</a>
+                <a href="/costs"><span class="nav-icon">💰</span> Costs</a>
+                <a href="/settings"><span class="nav-icon">⚙️</span> Settings</a>
+            </nav>
+            <div class="controls">
+                <div class="time-range-selector">
+                    <label for="timeRange">Time Range:</label>
+                    <select id="timeRange" onchange="onTimeRangeChange()">
+                        <option value="3600">Last 1 Hour</option>
+                        <option value="21600">Last 6 Hours</option>
+                        <option value="86400" selected>Last 24 Hours</option>
+                        <option value="604800">Last 7 Days</option>
+                        <option value="2592000">Last 30 Days</option>
+                    </select>
+                </div>
+                <button class="refresh-btn" onclick="loadAgents()">↻ Refresh</button>
+            </div>
+        </header>
+
+        <div class="dashboard-content">
+            <aside class="agent-panel" id="agentPanel">
+                <div class="list-header">
+                    <h3>Agents (<span id="agentCount">0</span>)</h3>
+                </div>
+                <div id="agentList" class="list-items">
+                    <div class="loading"><div class="spinner"></div><span>Loading agents...</span></div>
+                </div>
+            </aside>
+
+            <main class="detail-panel" id="detailPanel">
+                <div class="placeholder">
+                    <div class="placeholder-icon">📊</div>
+                    <h2>Select an agent to view details</h2>
+                    <p>Choose an agent from the list to see its metadata and session activity.</p>
+                </div>
+            </main>
+
+            <!-- Session Detail Slide-out Panel -->
+            <aside class="session-detail-panel" id="sessionDetailPanel">
+                <div class="session-detail-header">
+                    <h3>Session Details</h3>
+                    <button class="close-btn" onclick="closeSessionDetail()">✕</button>
+                </div>
+                <div id="sessionDetailContent">
+                </div>
+            </aside>
+        </div>
+    </div>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
