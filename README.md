@@ -12,24 +12,19 @@ A lightweight dashboard for monitoring Bedrock AgentCore agents. Pure Python bac
 ## Quick Start
 
 ```bash
-cd agentcore-dashboard-python
 
 # Install dependencies
 pip install -r requirements.txt
 
 # Run (set your AWS profile and regions)
-AWS_PROFILE=mohan CONFIGURED_REGIONS=us-east-1 python app.py
+export AWS_ACCESS_KEY_ID="<Acces key id>"
+export AWS_SECRET_ACCESS_KEY="<secret acess key>"
+export AWS_SESSION_TOKEN="<access token">
+python3 app.py
 ```
 
 Open http://localhost:3000
 
-## Configuration
-
-| Env Variable | Description | Default |
-|---|---|---|
-| `AWS_PROFILE` | AWS credential profile to use | default |
-| `CONFIGURED_REGIONS` | Comma-separated list of regions | us-east-1 |
-| `PORT` | Server port (via Flask) | 3000 |
 
 ## Project Structure
 
@@ -46,25 +41,12 @@ agentcore-dashboard-python/
 
 ## AWS Permissions Required
 
-- `bedrock-agentcore-control:ListAgentRuntimes`
-- `bedrock-agentcore-control:GetAgentRuntime`
+- `bedrock-agentcore-control:List*`
+- `bedrock-agentcore-control:Get*`
 - `logs:StartQuery`
 - `logs:GetQueryResults`
+- `pricing:GetProducts`
 
-## Deploy to AWS Amplify
-
-1. Add an `amplify.yml` build spec:
-```yaml
-version: 1
-frontend:
-  phases:
-    build:
-      commands:
-        - pip install -r requirements.txt
-  artifacts:
-    baseDirectory: .
-    files:
-      - '**/*'
 ```
 
-2. Or deploy as a container using AWS App Runner / ECS for the Flask backend.
+2. Deploy as a container using AWS App Runner / ECS for the Flask backend.
