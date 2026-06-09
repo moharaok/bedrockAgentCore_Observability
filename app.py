@@ -729,7 +729,7 @@ def get_sessions():
             | parse @message /\"aws.local.service\":\"(?<service>[^\"]+)\"/
             | parse @message /\"session.id\":\"(?<sessionId>[^\"]+)\"/
             | parse @message /\"aws.span.kind\":\"(?<spanKind>[^\"]+)\"/
-            | filter spanKind = 'LOCAL_ROOT'
+            | filter (spanKind = 'LOCAL_ROOT' or @message like /"name":"invoke_agent/)
             | filter ispresent(service)
             {filter_clause}
             | stats count(*) as spanCount, min(@timestamp) as firstSeen, max(@timestamp) as lastSeen by service, sessionId
@@ -786,7 +786,7 @@ def get_session_conversation(session_id):
                 control_client = boto3.client("bedrock-agentcore-control", region_name=region)
                 agent_detail = control_client.get_agent_runtime(agentRuntimeId=agent_id)
                 env_vars = agent_detail.get("environmentVariables", {})
-                memory_id = env_vars.get("BEDROCK_AGENTCORE_MEMORY_ID", "")
+                memory_id = env_vars.get("BEDROCK_AGENTCORE_MEMORY_ID", "") or env_vars.get("MEMORY_ID", "")
             except Exception:
                 pass
 
@@ -798,8 +798,20 @@ def get_session_conversation(session_id):
         if memory_id and actor_id:
             event_messages = load_conversation_from_events(region, memory_id, actor_id, session_id)
 
+        # Narrow time window for model invocation logs based on actual span timestamps
+        # This prevents pulling unrelated logs from the full time range
+        llm_start = start_time
+        llm_end = end_time
+        if spans:
+            first_nano = spans[0].get("startTimeUnixNano", 0)
+            last_nano = spans[-1].get("startTimeUnixNano", 0) + spans[-1].get("durationNano", 0)
+            if first_nano:
+                llm_start = int(first_nano / 1_000_000_000) - 5  # 5s buffer
+            if last_nano:
+                llm_end = int(last_nano / 1_000_000_000) + 5
+
         # Load model invocation logs (full agent↔LLM messages)
-        llm_conversations = load_model_invocation_logs(region, session_id, start_time, end_time)
+        llm_conversations = load_model_invocation_logs(region, session_id, llm_start, llm_end)
 
         # Build clean narrative
         conversation = build_clean_narrative(spans, event_messages, llm_conversations)
@@ -863,6 +875,23 @@ def load_model_invocation_logs(region, session_id, start_time, end_time):
                     log_entry = json.loads(message)
                     body = log_entry.get("input", {}).get("inputBodyJson", {})
                     out_body = log_entry.get("output", {}).get("outputBodyJson", {})
+
+                    # Extract agent name from identity ARN
+                    # Format: arn:aws:sts::...:assumed-role/<role-name>/BedrockAgentCore-...
+                    identity_arn = log_entry.get("identity", {}).get("arn", "")
+                    agent_label = ""
+                    if identity_arn:
+                        parts = identity_arn.split("/")
+                        if len(parts) >= 2:
+                            role_name = parts[1]  # e.g. "marvin-agentcore-runtime-ExecutionRole605A040B-xxx"
+                            # Extract meaningful name: strip common suffixes
+                            import re
+                            match = re.match(r"(.+?)-?ExecutionRole[^-]*-.*", role_name)
+                            if match:
+                                agent_label = match.group(1)
+                            else:
+                                agent_label = role_name
+
                     invocations.append({
                         "timestamp": timestamp,
                         "model": log_entry.get("modelId", ""),
@@ -873,6 +902,7 @@ def load_model_invocation_logs(region, session_id, start_time, end_time):
                         "messages": body.get("messages", []),
                         "llm_output": out_body.get("output", {}).get("message", {}),
                         "tools_config": body.get("toolConfig", {}),
+                        "agent_label": agent_label,
                     })
                 except (json.JSONDecodeError, KeyError, TypeError):
                     continue
@@ -953,7 +983,13 @@ def build_clean_narrative(spans, event_messages, llm_conversations=None):
         timestamp = span.get("_timestamp", "")
         events = span.get("events", [])
 
-        if name == "AgentCore.Runtime.Invoke":
+        # Detect invocation start: AgentCore native or Strands SDK
+        is_invocation_start = (
+            name == "AgentCore.Runtime.Invoke"
+            or (name.startswith("invoke_agent") and attrs.get("gen_ai.agent.tools"))
+        )
+
+        if is_invocation_start:
             if current_invocation:
                 invocations.append(current_invocation)
             current_invocation = {
@@ -961,6 +997,37 @@ def build_clean_narrative(spans, event_messages, llm_conversations=None):
                 "total_duration_ms": duration_ms,
                 "sub_steps": [],
             }
+            # For Strands SDK, the invoke_agent span IS the invocation AND contains
+            # model/token/tool info (unlike AgentCore where it's a child span)
+            if "invoke_agent" in name and name != "AgentCore.Runtime.Invoke":
+                model = attrs.get("gen_ai.request.model", "unknown")
+                input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
+                output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
+                tools_raw = attrs.get("gen_ai.agent.tools", "[]")
+                try:
+                    tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
+                except:
+                    tools = []
+                tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
+
+                current_invocation["model"] = model
+                current_invocation["tools"] = tool_names
+                current_invocation["input_tokens"] = input_tokens
+                current_invocation["output_tokens"] = output_tokens
+
+                llm_content = (
+                    f"Sent request to **{model}**\n"
+                    f"System prompt + conversation history: {input_tokens} tokens\n"
+                    f"Tools provided: {', '.join(tool_names)}\n"
+                    f"LLM generated: {output_tokens} tokens\n"
+                    f"Total duration: {duration_ms}ms"
+                )
+                current_invocation["sub_steps"].append({
+                    "icon": "🧠",
+                    "title": "Agent → LLM",
+                    "style": "llm",
+                    "content": llm_content,
+                })
 
         elif current_invocation is not None:
             # Agent → LLM: invoke_agent (shows tools sent to LLM)
@@ -1310,7 +1377,176 @@ def build_clean_narrative(spans, event_messages, llm_conversations=None):
 
         return steps
 
-    # Fallback: spans only
+    # Fallback: spans + model invocation logs (no event_messages)
+    # Build narrative from model invocation logs and span data
+    if invocations and llm_conversations:
+        # Determine the primary agent (orchestrator) by taking the first log's agent_label
+        primary_agent = llm_conversations[0].get("agent_label", "") if llm_conversations else ""
+
+        for llm_idx, llm_log in enumerate(llm_conversations):
+            agent_label = llm_log.get("agent_label", "")
+            is_sub_agent = agent_label and primary_agent and agent_label != primary_agent
+
+            # Sub-agent header (only show when transitioning from primary to sub-agent)
+            if is_sub_agent:
+                prev_agent = llm_conversations[llm_idx - 1].get("agent_label", "") if llm_idx > 0 else primary_agent
+                if prev_agent == primary_agent or prev_agent != agent_label:
+                    # Derive a friendly sub-agent name
+                    sub_name = agent_label.replace("marvin-agentcore-", "").replace("-", " ").title()
+                    steps.append({
+                        "timestamp": llm_log.get("timestamp", ""),
+                        "step": "sub_agent_start",
+                        "title": f"↳ Sub-agent: {sub_name}",
+                        "content": f"Orchestrator delegated to **{sub_name}**",
+                        "icon": "🔀",
+                        "style": "gateway",
+                        "agent_label": agent_label,
+                    })
+
+            # Extract user message from the first 'user' role message
+            user_text = ""
+            for m in llm_log.get("messages", []):
+                if m.get("role") == "user":
+                    for c in m.get("content", []):
+                        if "text" in c:
+                            user_text = c["text"]
+                            break
+                    if user_text:
+                        break
+
+            if user_text:
+                title = "User" if not is_sub_agent else f"↳ Input to {agent_label.replace('marvin-agentcore-', '').replace('-', ' ').title()}"
+                steps.append({
+                    "timestamp": llm_log.get("timestamp", ""),
+                    "step": "user_message",
+                    "title": title,
+                    "content": user_text,
+                    "icon": "👤" if not is_sub_agent else "📨",
+                    "style": "user" if not is_sub_agent else "llm_messages",
+                    "agent_label": agent_label,
+                })
+
+            # Add system prompt on first invocation per agent
+            if llm_log.get("system_prompt"):
+                # Only show system prompt for the first occurrence of each agent
+                shown_prompts = [s.get("agent_label") for s in steps if s.get("step") == "system_prompt"]
+                if agent_label not in shown_prompts:
+                    sys_text = ""
+                    for sp in llm_log["system_prompt"]:
+                        if "text" in sp:
+                            sys_text += sp["text"]
+                    if sys_text:
+                        steps.append({
+                            "timestamp": llm_log.get("timestamp", ""),
+                            "step": "system_prompt",
+                            "title": "System Prompt" if not is_sub_agent else f"↳ System Prompt ({agent_label.replace('marvin-agentcore-', '').replace('-', ' ').title()})",
+                            "content": sys_text[:2000],
+                            "icon": "📜",
+                            "style": "system_prompt",
+                            "agent_label": agent_label,
+                        })
+
+            # Add span sub-steps if available for this invocation
+            if llm_idx < len(invocations):
+                inv = invocations[llm_idx]
+                for sub in inv["sub_steps"]:
+                    step_entry = {
+                        "timestamp": inv["timestamp"],
+                        "step": sub.get("title", ""),
+                        "title": f"↳ {sub['title']}" if is_sub_agent else sub["title"],
+                        "content": sub["content"],
+                        "icon": sub["icon"],
+                        "style": sub["style"],
+                    }
+                    steps.append(step_entry)
+
+            # Add tool calls and results from messages
+            for m in llm_log.get("messages", []):
+                role = m.get("role", "")
+                for c in m.get("content", []):
+                    if "toolUse" in c and role == "assistant":
+                        tool_name_raw = c["toolUse"].get("name", "")
+                        display = tool_name_raw.split("___")[-1] if "___" in tool_name_raw else tool_name_raw
+                        tool_inp = json.dumps(c["toolUse"].get("input", {}))[:500]
+                        steps.append({
+                            "timestamp": llm_log.get("timestamp", ""),
+                            "step": "tool_call",
+                            "title": f"{'↳ ' if is_sub_agent else ''}LLM decided: call '{display}'",
+                            "content": f"**{display}**\n```json\n{tool_inp}\n```",
+                            "icon": "🔧",
+                            "style": "tool_call",
+                        })
+                    elif "toolResult" in c and role == "user":
+                        status = c["toolResult"].get("status", "success")
+                        rc_text = ""
+                        for rc in c["toolResult"].get("content", []):
+                            if "text" in rc:
+                                rc_text = rc["text"][:500]
+                        steps.append({
+                            "timestamp": llm_log.get("timestamp", ""),
+                            "step": "tool_result",
+                            "title": f"{'↳ ' if is_sub_agent else ''}Tool response ({status})",
+                            "content": rc_text,
+                            "icon": "📥" if status != "error" else "❌",
+                            "style": "tool_result" if status != "error" else "error",
+                        })
+
+            # Add LLM output (assistant response)
+            llm_output = llm_log.get("llm_output", {})
+            if llm_output:
+                for c in llm_output.get("content", []):
+                    if "text" in c:
+                        steps.append({
+                            "timestamp": llm_log.get("timestamp", ""),
+                            "step": "agent_response",
+                            "title": f"{'↳ ' if is_sub_agent else ''}Agent → User",
+                            "content": c["text"],
+                            "icon": "🤖",
+                            "style": "assistant",
+                        })
+                    elif "toolUse" in c:
+                        tool_name_raw = c["toolUse"].get("name", "")
+                        display = tool_name_raw.split("___")[-1] if "___" in tool_name_raw else tool_name_raw
+                        tool_inp = json.dumps(c["toolUse"].get("input", {}))[:500]
+                        steps.append({
+                            "timestamp": llm_log.get("timestamp", ""),
+                            "step": "tool_call",
+                            "title": f"{'↳ ' if is_sub_agent else ''}LLM decided: call '{display}'",
+                            "content": f"**{display}**\n```json\n{tool_inp}\n```",
+                            "icon": "🔧",
+                            "style": "tool_call",
+                        })
+
+            # Sub-agent end marker
+            if is_sub_agent:
+                # Check if the next log is back to primary agent
+                next_is_primary = (llm_idx + 1 < len(llm_conversations) and
+                                   llm_conversations[llm_idx + 1].get("agent_label", "") == primary_agent)
+                if next_is_primary or llm_idx == len(llm_conversations) - 1:
+                    steps.append({
+                        "timestamp": llm_log.get("timestamp", ""),
+                        "step": "sub_agent_end",
+                        "title": f"↳ Sub-agent complete",
+                        "content": f"Returning result to orchestrator",
+                        "icon": "↩️",
+                        "style": "gateway",
+                    })
+            else:
+                # Add summary for orchestrator invocations
+                if llm_idx < len(invocations):
+                    inv = invocations[llm_idx]
+                    steps.append({
+                        "timestamp": inv["timestamp"],
+                        "step": "summary",
+                        "title": f"⏱️ Total: {inv['total_duration_ms']}ms",
+                        "content": f"Model: {inv.get('model','unknown')} | Tokens: {inv.get('input_tokens', '?')} in → {inv.get('output_tokens', '?')} out",
+                        "icon": "📊",
+                        "style": "summary",
+                    })
+
+        return steps
+
+    # Fallback: spans only (no model invocation logs either)
     if invocations:
         for inv in invocations:
             for sub in inv["sub_steps"]:
@@ -1905,7 +2141,13 @@ def get_session_metrics(session_id):
             attrs = s.get("attributes", {})
             duration_ms = round(s.get("durationNano", 0) / 1_000_000, 1)
 
-            if name == "AgentCore.Runtime.Invoke":
+            # Detect invocation: AgentCore native or Strands SDK
+            is_invocation = (
+                name == "AgentCore.Runtime.Invoke"
+                or (name.startswith("invoke_agent") and attrs.get("gen_ai.agent.tools"))
+            )
+
+            if is_invocation:
                 total_invocations += 1
                 latency = attrs.get("latency_ms", duration_ms)
                 invocation_latencies.append(latency)
@@ -1913,6 +2155,15 @@ def get_session_metrics(session_id):
                 status = attrs.get("http.response.status_code", attrs.get("http.status_code", 200))
                 if int(status) >= 400:
                     http_errors += 1
+                # For Strands agents, invoke_agent also carries token/model info
+                if "invoke_agent" in name and name != "AgentCore.Runtime.Invoke":
+                    total_tokens_in += attrs.get("gen_ai.usage.input_tokens", 0)
+                    total_tokens_out += attrs.get("gen_ai.usage.output_tokens", 0)
+                    total_cache_read += attrs.get("gen_ai.usage.cache_read_input_tokens", 0)
+                    total_cache_write += attrs.get("gen_ai.usage.cache_write_input_tokens", 0)
+                    model = attrs.get("gen_ai.request.model", "")
+                    if model:
+                        models_used.add(model)
 
             elif "invoke_agent" in name:
                 total_tokens_in += attrs.get("gen_ai.usage.input_tokens", 0)
@@ -2052,4 +2303,4 @@ def get_session_metrics(session_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0",port=3000)
+    app.run(debug=True, port=3000)
