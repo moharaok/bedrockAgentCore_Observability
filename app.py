@@ -16,6 +16,34 @@ CONFIGURED_REGIONS = os.environ.get("CONFIGURED_REGIONS", "").split(",") if os.e
 LOG_GROUPS = CONFIG.get("log_groups", {})
 PRICING_CONFIG = CONFIG.get("pricing", {})
 
+
+def get_default_region():
+    """Return the landing-page default region. Used ONLY for initial UI state — never as
+    a silent fallback inside API endpoints. API callers must pass `region` explicitly."""
+    return CONFIG.get("default_region") or (CONFIGURED_REGIONS[0] if CONFIGURED_REGIONS else "us-east-1")
+
+
+class BadRequest(Exception):
+    """Client-error condition that should be reported as HTTP 400."""
+
+
+def require_region():
+    """Pull `region` from the request. Raises BadRequest (HTTP 400) if missing/invalid.
+
+    The frontend always sends the user's selected region; a missing `region` indicates
+    a client bug or a direct API caller that needs to specify one. Better to fail fast
+    than silently query the wrong account/region.
+    """
+    region = request.args.get("region", "").strip()
+    if not region:
+        raise BadRequest("Query parameter 'region' is required")
+    if region not in CONFIGURED_REGIONS:
+        raise BadRequest(
+            f"Region '{region}' is not in the configured regions list "
+            f"({', '.join(CONFIGURED_REGIONS) or 'none'}). Add it on the Settings page."
+        )
+    return region
+
 # Build pricing lookup from config
 BEDROCK_PRICING = {}
 for model_id, prices in PRICING_CONFIG.get("models", {}).items():
@@ -23,6 +51,11 @@ for model_id, prices in PRICING_CONFIG.get("models", {}).items():
         "input": prices["input_per_1k"],
         "output": prices["output_per_1k"],
     }
+
+
+@app.errorhandler(BadRequest)
+def _handle_bad_request(err):
+    return jsonify({"error": str(err)}), 400
 
 
 _CROSS_REGION_PREFIXES = ("us.", "global.", "eu.", "apac.", "us-gov.")
@@ -87,7 +120,7 @@ def get_config():
     """Return non-sensitive config for the frontend."""
     return jsonify({
         "regions": CONFIGURED_REGIONS,
-        "default_region": CONFIG.get("default_region", CONFIGURED_REGIONS[0] if CONFIGURED_REGIONS else "us-east-1"),
+        "default_region": get_default_region(),
         "default_time_range": CONFIG.get("default_time_range", "86400"),
         "log_groups": LOG_GROUPS,
         "pricing_source": PRICING_CONFIG.get("source_url", ""),
@@ -347,11 +380,11 @@ def delete_model_pricing(model_id):
 def get_summary():
     """Aggregate metrics across all agents for the landing page."""
     seconds = int(request.args.get("seconds", 86400))  # Default: last 24h
-    region = request.args.get("region", CONFIGURED_REGIONS[0])
     end_time = int(time.time())
     start_time = end_time - seconds
 
     try:
+        region = require_region()
         client = boto3.client("logs", region_name=region)
 
         # Query aws/spans for aggregate metrics
@@ -545,11 +578,11 @@ def get_summary():
 def get_costs():
     """Get detailed cost breakdown with multiple dimensions."""
     seconds = int(request.args.get("seconds", 86400))
-    region = request.args.get("region", CONFIGURED_REGIONS[0])
     end_time = int(time.time())
     start_time = end_time - seconds
 
     try:
+        region = require_region()
         client = boto3.client("logs", region_name=region)
 
         # Query spans with all dimensions we need
@@ -747,7 +780,7 @@ def is_uuid_part(s):
 
 @app.route("/api/agents")
 def list_agents():
-    region = request.args.get("region", CONFIGURED_REGIONS[0])
+    region = require_region()
     all_agents = []
     try:
         client = boto3.client("bedrock-agentcore-control", region_name=region)
@@ -768,7 +801,7 @@ def list_agents():
 
 @app.route("/api/agents/<agent_id>/detail")
 def get_agent_detail(agent_id):
-    region = request.args.get("region", "us-east-1")
+    region = require_region()
     try:
         client = boto3.client("bedrock-agentcore-control", region_name=region)
         result = client.get_agent_runtime(agentRuntimeId=agent_id)
@@ -785,7 +818,7 @@ def get_agent_detail(agent_id):
 
 @app.route("/api/sessions")
 def get_sessions():
-    region = request.args.get("region", "us-east-1")
+    region = require_region()
     start_time = int(request.args.get("startTime", int(time.time()) - 86400))
     end_time = int(request.args.get("endTime", int(time.time())))
     agent_name = request.args.get("agentName", "")
@@ -843,66 +876,36 @@ def get_sessions():
 
 @app.route("/api/sessions/<session_id>/conversation")
 def get_session_conversation(session_id):
-    """Load full conversation as a clean step-by-step narrative."""
-    region = request.args.get("region", "us-east-1")
+    """Load the full conversation as a step-by-step actor-flow narrative.
+
+    Falls back to the raw runtime-log message timeline if the span data is empty,
+    so we degrade gracefully when only one of the two log streams is available.
+    """
+    region = require_region()
     agent_id = request.args.get("agentId", "")
     start_time = int(request.args.get("startTime", int(time.time()) - 2592000))
     end_time = int(request.args.get("endTime", int(time.time())))
 
     try:
-        # Extract actor_id from session_id pattern
-        # Some session IDs use format "actorId_sessionUUID", others are plain UUIDs
+        # session_id is sometimes "actorId_uuid", sometimes a plain UUID
         actor_id = session_id.split("_")[0] if "_" in session_id else session_id
 
-        # Get memory_id from agent's environment variables
-        memory_id = request.args.get("memoryId", "")
-        if not memory_id and agent_id:
-            try:
-                control_client = boto3.client("bedrock-agentcore-control", region_name=region)
-                agent_detail = control_client.get_agent_runtime(agentRuntimeId=agent_id)
-                env_vars = agent_detail.get("environmentVariables", {})
-                memory_id = env_vars.get("BEDROCK_AGENTCORE_MEMORY_ID", "") or env_vars.get("MEMORY_ID", "")
-            except Exception:
-                pass
-
-        # Load raw spans
         spans = load_raw_spans(region, session_id, start_time, end_time)
-
-        # Load events (actual messages) if memory available
-        event_messages = []
-        if memory_id and actor_id:
-            event_messages = load_conversation_from_events(region, memory_id, actor_id, session_id)
-
-        # Always try agent runtime logs for the actual conversation content
-        # (spans only give us metadata like model, tokens, duration - not the messages)
         runtime_conversation = load_conversation_from_runtime_logs(
             region, agent_id, session_id, start_time, end_time
         )
 
-        view = request.args.get("view", "actor_flow")  # "actor_flow" | "messages" | "legacy"
-
-        if view == "actor_flow" and spans:
+        if spans:
             conversation = build_actor_flow_narrative(spans, runtime_conversation)
-            # If span data was thin and the flow is empty, fall back to message view
             if not conversation:
-                conversation = runtime_conversation or build_clean_narrative(spans, event_messages)
-        elif view == "messages" and runtime_conversation:
-            conversation = runtime_conversation
+                conversation = runtime_conversation
         else:
-            conversation = build_clean_narrative(spans, event_messages)
-            if runtime_conversation:
-                has_content = any(
-                    s.get("style") in ("user", "assistant") for s in runtime_conversation
-                )
-                if has_content:
-                    conversation = runtime_conversation
+            conversation = runtime_conversation
 
         return jsonify({
             "conversation": conversation,
             "sessionId": session_id,
             "actorId": actor_id,
-            "memoryId": memory_id,
-            "view": view,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1406,28 +1409,6 @@ def _parse_content_blocks(text):
     return result
 
 
-def _parse_tool_result_text(text):
-    """Parse tool result text which may be JSON content blocks."""
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return json.dumps(parsed, indent=2)
-        elif isinstance(parsed, list):
-            texts = []
-            for item in parsed:
-                if isinstance(item, dict):
-                    if "text" in item:
-                        texts.append(item["text"])
-                    elif "toolResult" in item:
-                        for c in item["toolResult"].get("content", []):
-                            if "text" in c:
-                                texts.append(c["text"])
-            return "\n".join(texts) if texts else text
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return text
-
-
 def _extract_invocations_from_spans(spans):
     """Group spans into per-invocation buckets by time-window of AgentCore.Runtime.Invoke (or invoke_agent).
 
@@ -1865,836 +1846,9 @@ def _extract_json_block(markdown_text):
     return m.group(1).strip() if m else ""
 
 
-def build_clean_narrative(spans, event_messages):
-    """
-    Build a clean, step-by-step narrative combining spans and events.
-    Includes: user messages, agent↔LLM exchanges, agent↔gateway calls, tool results.
-    """
-    steps = []
-
-    # Parse spans into invocations with detailed sub-steps
-    invocations = []
-    current_invocation = None
-
-    for span in spans:
-        name = span.get("name", "")
-        kind = span.get("kind", "")
-        attrs = span.get("attributes", {})
-        duration_ns = span.get("durationNano", 0)
-        duration_ms = round(duration_ns / 1_000_000, 1)
-        timestamp = span.get("_timestamp", "")
-        events = span.get("events", [])
-
-        # Detect invocation start: AgentCore native or Strands SDK
-        is_invocation_start = (
-            name == "AgentCore.Runtime.Invoke"
-            or (name.startswith("invoke_agent") and attrs.get("gen_ai.agent.tools"))
-        )
-
-        if is_invocation_start:
-            if current_invocation:
-                invocations.append(current_invocation)
-            current_invocation = {
-                "timestamp": timestamp,
-                "total_duration_ms": duration_ms,
-                "sub_steps": [],
-            }
-            # For Strands SDK, the invoke_agent span IS the invocation AND contains
-            # model/token/tool info (unlike AgentCore where it's a child span)
-            if "invoke_agent" in name and name != "AgentCore.Runtime.Invoke":
-                model = attrs.get("gen_ai.request.model", "unknown")
-                input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-                output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-                tools_raw = attrs.get("gen_ai.agent.tools", "[]")
-                try:
-                    tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-                except Exception:
-                    tools = []
-                tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
-
-                current_invocation["model"] = model
-                current_invocation["tools"] = tool_names
-                current_invocation["input_tokens"] = input_tokens
-                current_invocation["output_tokens"] = output_tokens
-
-                llm_content = (
-                    f"Sent request to **{model}**\n"
-                    f"System prompt + conversation history: {input_tokens} tokens\n"
-                    f"Tools provided: {', '.join(tool_names)}\n"
-                    f"LLM generated: {output_tokens} tokens\n"
-                    f"Total duration: {duration_ms}ms"
-                )
-                current_invocation["sub_steps"].append({
-                    "icon": "🧠",
-                    "title": "Agent → LLM",
-                    "style": "llm",
-                    "content": llm_content,
-                })
-
-        elif current_invocation is not None:
-            # Agent → LLM: invoke_agent (shows tools sent to LLM)
-            if "invoke_agent" in name:
-                model = attrs.get("gen_ai.request.model", "unknown")
-                input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-                output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-                tools_raw = attrs.get("gen_ai.agent.tools", "[]")
-                try:
-                    tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-                except Exception:
-                    tools = []
-                tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
-
-                current_invocation["model"] = model
-                current_invocation["tools"] = tool_names
-                current_invocation["input_tokens"] = input_tokens
-                current_invocation["output_tokens"] = output_tokens
-
-                # Build content with actual LLM messages if available
-                llm_content = (
-                    f"Sent request to **{model}**\n"
-                    f"System prompt + conversation history: {input_tokens} tokens\n"
-                    f"Tools provided: {', '.join(tool_names)}\n"
-                    f"LLM generated: {output_tokens} tokens\n"
-                    f"Total duration: {duration_ms}ms"
-                )
-
-                current_invocation["sub_steps"].append({
-                    "icon": "🧠",
-                    "title": "Agent → LLM",
-                    "style": "llm",
-                    "content": llm_content,
-                })
-
-            # LLM thinking (chat span with TTFT = the real one)
-            elif (name == "chat" or name.startswith("chat ")) and attrs.get("gen_ai.server.time_to_first_token"):
-                model = attrs.get("gen_ai.request.model", "")
-                input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-                output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-                ttft = attrs.get("gen_ai.server.time_to_first_token", "")
-                request_duration = attrs.get("gen_ai.server.request.duration", "")
-
-                current_invocation["sub_steps"].append({
-                    "icon": "💬",
-                    "title": "LLM Thinking",
-                    "style": "llm",
-                    "content": (
-                        f"Model: `{model}`\n"
-                        f"Input: {input_tokens} tokens → Output: {output_tokens} tokens\n"
-                        f"Time to first token: {ttft}ms\n"
-                        f"Response time: {request_duration}ms | Total: {duration_ms}ms"
-                    ),
-                })
-
-            # Tool execution
-            elif "execute_tool" in name:
-                tool_name = attrs.get("gen_ai.tool.name", "")
-                tool_status = attrs.get("gen_ai.tool.status", "")
-                display_name = tool_name.split("___")[-1] if "___" in tool_name else tool_name
-                icon = "✅" if tool_status == "success" else "❌"
-
-                current_invocation["sub_steps"].append({
-                    "icon": "🔧",
-                    "title": f"LLM → Agent: Use tool '{display_name}'",
-                    "style": "tool_call",
-                    "content": f"Agent executed tool: **{display_name}**\nStatus: {icon} {tool_status} | Duration: {duration_ms}ms",
-                })
-
-                # Errors
-                for evt in events:
-                    evt_attrs = evt.get("attributes", {})
-                    if evt_attrs.get("exception.type"):
-                        current_invocation["sub_steps"].append({
-                            "icon": "❌",
-                            "title": "Error",
-                            "style": "error",
-                            "content": f"**{evt_attrs['exception.type']}**\n{evt_attrs.get('exception.message', '')[:300]}",
-                        })
-
-            # Gateway calls (agent calling MCP gateway)
-            elif kind == "CLIENT" and ("POST" in name or "GET" in name) and "invocations" not in name:
-                url = attrs.get("http.url", attrs.get("http.target", ""))
-                status_code = attrs.get("http.status_code", attrs.get("http.response.status_code", ""))
-
-                # Only include gateway/MCP calls, skip internal
-                if "gateway" in url or "mcp" in url or "bedrock-agentcore" in url:
-                    # Determine if this is a tool execution call (longer, after execute_tool)
-                    # or an init/handshake call (short, at start)
-                    # Init calls are typically < 400ms and happen before any execute_tool
-                    has_tool_execution = any(
-                        s.get("title", "").startswith("LLM → Agent")
-                        for s in current_invocation["sub_steps"]
-                    )
-
-                    if not has_tool_execution and duration_ms < 400:
-                        # This is MCP initialization (listing tools, handshake)
-                        # Group them - only add one summary entry
-                        if not any(s.get("title") == "Gateway: MCP Initialization" for s in current_invocation["sub_steps"]):
-                            current_invocation["sub_steps"].append({
-                                "icon": "🌐",
-                                "title": "Gateway: MCP Initialization",
-                                "style": "gateway",
-                                "content": "Connecting to MCP gateway and loading available tools...",
-                                "_is_init_placeholder": True,
-                            })
-                        # Update the placeholder with count
-                        for s in current_invocation["sub_steps"]:
-                            if s.get("_is_init_placeholder"):
-                                count = s.get("_init_count", 0) + 1
-                                s["_init_count"] = count
-                                total_dur = s.get("_init_total_ms", 0) + duration_ms
-                                s["_init_total_ms"] = total_dur
-                                s["content"] = f"Connected to MCP gateway, loaded tools ({count} requests, {total_dur:.0f}ms total)"
-                    else:
-                        # This is an actual tool execution gateway call
-                        from urllib.parse import urlparse
-                        parsed = urlparse(url) if url else None
-                        host = parsed.hostname if parsed else ""
-                        path = parsed.path if parsed else ""
-                        status_icon = "✅" if str(status_code).startswith("2") else "❌"
-                        current_invocation["sub_steps"].append({
-                            "icon": "🌐",
-                            "title": "Agent → Gateway (tool execution)",
-                            "style": "gateway",
-                            "content": f"**POST** {path}\nGateway: {host}\nStatus: {status_icon} {status_code} | Duration: {duration_ms}ms",
-                        })
-
-            # Bedrock API calls (ListEvents, CreateEvent, etc.)
-            elif kind == "CLIENT" and "Bedrock" in name:
-                remote_op = attrs.get("aws.remote.operation", attrs.get("rpc.method", ""))
-                status_code = attrs.get("http.status_code", "")
-                # Only show non-trivial ones
-                if remote_op not in ("ListEvents", "CreateEvent"):
-                    status_icon = "✅" if str(status_code).startswith("2") else "❌"
-                    current_invocation["sub_steps"].append({
-                        "icon": "☁️",
-                        "title": f"Agent → AWS: {remote_op}",
-                        "style": "aws_api",
-                        "content": f"**{name}**\nStatus: {status_icon} {status_code} | Duration: {duration_ms}ms",
-                    })
-
-    if current_invocation:
-        invocations.append(current_invocation)
-
-    # Now build the final narrative: interleave event messages with span sub-steps
-    if event_messages and invocations:
-        inv_idx = 0
-        i = 0
-        while i < len(event_messages):
-            msg = event_messages[i]
-
-            if msg["role"] == "user" and msg.get("type") == "user_message":
-                # User message
-                steps.append({
-                    "timestamp": msg["timestamp"],
-                    "step": "user_message",
-                    "title": "User",
-                    "content": msg["content"],
-                    "icon": "👤",
-                    "style": "user",
-                })
-                i += 1
-
-                # Add span sub-steps for this invocation (agent↔LLM, gateway calls)
-                if inv_idx < len(invocations):
-                    inv = invocations[inv_idx]
-                    for sub in inv["sub_steps"]:
-                        steps.append({
-                            "timestamp": inv["timestamp"],
-                            "step": sub.get("title", ""),
-                            "title": sub["title"],
-                            "content": sub["content"],
-                            "icon": sub["icon"],
-                            "style": sub["style"],
-                        })
-
-                # Continue with tool calls and tool results until we hit agent response or next user msg
-                while i < len(event_messages):
-                    msg = event_messages[i]
-                    if msg["role"] == "user" and msg.get("type") == "user_message":
-                        # Next user message — break out to handle it in the outer loop
-                        # First close the current invocation with a summary
-                        if inv_idx < len(invocations):
-                            inv = invocations[inv_idx]
-                            steps.append({
-                                "timestamp": inv["timestamp"],
-                                "step": "summary",
-                                "title": f"⏱️ Total: {inv['total_duration_ms']}ms",
-                                "content": f"Model: {inv.get('model','unknown')} | Tokens: {inv.get('input_tokens', '?')} in → {inv.get('output_tokens', '?')} out",
-                                "icon": "📊",
-                                "style": "summary",
-                            })
-                            inv_idx += 1
-                        break
-                    elif msg["role"] == "assistant" and msg.get("type") == "assistant_message":
-                        # Agent response
-                        steps.append({
-                            "timestamp": msg["timestamp"],
-                            "step": "agent_response",
-                            "title": "Agent → User",
-                            "content": msg["content"],
-                            "icon": "🤖",
-                            "style": "assistant",
-                        })
-                        i += 1
-
-                        # Add summary
-                        if inv_idx < len(invocations):
-                            inv = invocations[inv_idx]
-                            steps.append({
-                                "timestamp": inv["timestamp"],
-                                "step": "summary",
-                                "title": f"⏱️ Total: {inv['total_duration_ms']}ms",
-                                "content": f"Model: {inv.get('model','unknown')} | Tokens: {inv.get('input_tokens', '?')} in → {inv.get('output_tokens', '?')} out",
-                                "icon": "📊",
-                                "style": "summary",
-                            })
-                            inv_idx += 1
-                        break
-                    elif msg["role"] == "tool_call":
-                        steps.append({
-                            "timestamp": msg["timestamp"],
-                            "step": "tool_call",
-                            "title": f"LLM decided: call '{msg.get('tool_name', '')}'",
-                            "content": msg["content"],
-                            "icon": "🔧",
-                            "style": "tool_call",
-                        })
-                        i += 1
-                    elif msg["role"] == "tool_result":
-                        steps.append({
-                            "timestamp": msg["timestamp"],
-                            "step": "tool_result",
-                            "title": f"Tool response ({msg.get('status', '')})",
-                            "content": msg["content"],
-                            "icon": "📥" if msg.get("status") != "error" else "❌",
-                            "style": "tool_result" if msg.get("status") != "error" else "error",
-                        })
-                        i += 1
-                    else:
-                        i += 1
-                        break
-            else:
-                # Non-user-message at top level (orphan tool calls, assistant msgs)
-                if msg["role"] == "tool_call":
-                    steps.append({
-                        "timestamp": msg["timestamp"],
-                        "step": "tool_call",
-                        "title": f"LLM decided: call '{msg.get('tool_name', '')}'",
-                        "content": msg["content"],
-                        "icon": "🔧",
-                        "style": "tool_call",
-                    })
-                elif msg["role"] == "tool_result":
-                    steps.append({
-                        "timestamp": msg["timestamp"],
-                        "step": "tool_result",
-                        "title": f"Tool response ({msg.get('status', '')})",
-                        "content": msg["content"],
-                        "icon": "📥" if msg.get("status") != "error" else "❌",
-                        "style": "tool_result" if msg.get("status") != "error" else "error",
-                    })
-                elif msg["role"] == "assistant" and msg.get("type") == "assistant_message":
-                    steps.append({
-                        "timestamp": msg["timestamp"],
-                        "step": "agent_response",
-                        "title": "Agent → User",
-                        "content": msg["content"],
-                        "icon": "🤖",
-                        "style": "assistant",
-                    })
-                    if inv_idx < len(invocations):
-                        inv_idx += 1
-                i += 1
-
-        return steps
-
-    if invocations:
-        for inv in invocations:
-            for sub in inv["sub_steps"]:
-                steps.append({
-                    "timestamp": inv["timestamp"],
-                    "step": sub.get("title", ""),
-                    "title": sub["title"],
-                    "content": sub["content"],
-                    "icon": sub["icon"],
-                    "style": sub["style"],
-                })
-        return steps
-
-    return build_conversation_from_spans(spans)
-
-
-def load_conversation_from_events(region, memory_id, actor_id, session_id):
-    """Load full agent<->LLM conversation from Bedrock AgentCore Events API."""
-    client = boto3.client("bedrock-agentcore", region_name=region)
-
-    events = []
-    try:
-        paginator = client.get_paginator("list_events")
-        for page in paginator.paginate(
-            memoryId=memory_id,
-            actorId=actor_id,
-            sessionId=session_id,
-        ):
-            events.extend(page.get("events", []))
-    except Exception as e:
-        try:
-            result = client.list_events(
-                memoryId=memory_id,
-                actorId=actor_id,
-                sessionId=session_id,
-            )
-            events = result.get("events", [])
-        except Exception:
-            return [{"timestamp": "", "role": "system", "content": f"Could not load events: {str(e)}"}]
-
-    # Sort events by timestamp (oldest first)
-    events.sort(key=lambda e: e.get("eventTimestamp", ""))
-
-    # Parse full agent<->LLM conversation from events
-    conversation = []
-    for event in events:
-        timestamp = str(event.get("eventTimestamp", ""))
-        payload_list = event.get("payload", [])
-
-        for payload in payload_list:
-            if "conversational" not in payload:
-                continue
-
-            text_raw = payload["conversational"]["content"]["text"]
-            try:
-                inner = json.loads(text_raw)
-            except (json.JSONDecodeError, KeyError):
-                continue
-
-            msg = inner.get("message", {})
-            role = msg.get("role", "unknown")
-            content_parts = msg.get("content", [])
-
-            for part in content_parts:
-                if "text" in part:
-                    text = part["text"]
-                    # Determine if this is a user message to the agent
-                    import re
-                    customer_match = re.search(
-                        r"Current customer message:\s*(.+)",
-                        text, re.DOTALL
-                    )
-                    if customer_match and role == "user":
-                        # This is the actual user input
-                        user_msg = customer_match.group(1).strip()
-                        conversation.append({
-                            "timestamp": timestamp,
-                            "role": "user",
-                            "content": user_msg,
-                            "type": "user_message",
-                        })
-                    elif role == "user" and "<user_context>" in text:
-                        # User context without customer message (shouldn't happen but handle)
-                        cleaned = re.sub(r"<user_context>.*?</user_context>\s*", "", text, flags=re.DOTALL).strip()
-                        if cleaned:
-                            conversation.append({
-                                "timestamp": timestamp,
-                                "role": "user",
-                                "content": cleaned,
-                                "type": "user_message",
-                            })
-                    elif role == "assistant":
-                        # This is the agent's text response to the user
-                        conversation.append({
-                            "timestamp": timestamp,
-                            "role": "assistant",
-                            "content": text,
-                            "type": "assistant_message",
-                        })
-                    elif role == "user":
-                        # Plain user message without context wrapper
-                        conversation.append({
-                            "timestamp": timestamp,
-                            "role": "user",
-                            "content": text,
-                            "type": "user_message",
-                        })
-
-                elif "toolUse" in part:
-                    tool = part["toolUse"]
-                    tool_name = tool.get("name", "unknown")
-                    display_name = tool_name.split("___")[-1] if "___" in tool_name else tool_name
-                    tool_input = json.dumps(tool.get("input", {}), indent=2)
-
-                    conversation.append({
-                        "timestamp": timestamp,
-                        "role": "tool_call",
-                        "content": f"**{display_name}**\n```json\n{tool_input}\n```",
-                        "type": "tool_use",
-                        "tool_name": display_name,
-                    })
-
-                elif "toolResult" in part:
-                    result = part["toolResult"]
-                    status = result.get("status", "")
-                    result_content = result.get("content", [])
-                    result_text = ""
-                    for rc in result_content:
-                        if "text" in rc:
-                            result_text = rc["text"][:1000]
-                            break
-
-                    # Try to pretty-print JSON tool results
-                    try:
-                        parsed = json.loads(result_text)
-                        result_text = json.dumps(parsed, indent=2)[:1000]
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                    conversation.append({
-                        "timestamp": timestamp,
-                        "role": "tool_result",
-                        "content": result_text,
-                        "type": "tool_result",
-                        "status": status,
-                    })
-
-    return conversation
-
-
-def load_llm_interactions_from_spans(region, session_id, start_time, end_time):
-    """Load LLM calls, system prompts, and gateway interactions from aws/spans."""
-    client = boto3.client("logs", region_name=region)
-
-    query = f"""
-        fields @timestamp, @message
-        | filter @message like /"{session_id}"/
-        | sort @timestamp asc
-        | limit 1000
-    """.strip()
-
-    response = client.start_query(
-        logGroupNames=[LOG_GROUPS["spans"]],
-        startTime=start_time,
-        endTime=end_time,
-        queryString=query,
-    )
-    query_id = response["queryId"]
-
-    status = "Running"
-    results = []
-    while status in ("Running", "Scheduled"):
-        time.sleep(1)
-        result = client.get_query_results(queryId=query_id)
-        status = result.get("status", "Unknown")
-        results = result.get("results", [])
-
-    messages = []
-    for row in results:
-        msg_text = ""
-        timestamp = ""
-        for field in row:
-            if field["field"] == "@message":
-                msg_text = field["value"]
-            elif field["field"] == "@timestamp":
-                timestamp = field["value"]
-        if not msg_text:
-            continue
-        try:
-            span = json.loads(msg_text)
-        except json.JSONDecodeError:
-            continue
-
-        name = span.get("name", "")
-        kind = span.get("kind", "")
-        attrs = span.get("attributes", {})
-        duration_ns = span.get("durationNano", 0)
-        duration_ms = round(duration_ns / 1_000_000, 1)
-        events = span.get("events", [])
-
-        # AgentCore Runtime Invoke — incoming request
-        if name == "AgentCore.Runtime.Invoke":
-            messages.append({
-                "timestamp": timestamp,
-                "role": "system",
-                "content": f"⬇️ **Incoming Request** to agent runtime\nTotal processing time: {duration_ms}ms",
-                "type": "runtime_invoke",
-            })
-
-        # invoke_agent — agent orchestration with available tools
-        elif "invoke_agent" in name:
-            model = attrs.get("gen_ai.request.model", "unknown")
-            input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-            output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-            tools_raw = attrs.get("gen_ai.agent.tools", "[]")
-            try:
-                tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-            except Exception:
-                tools = []
-            tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
-
-            messages.append({
-                "timestamp": timestamp,
-                "role": "llm",
-                "content": (
-                    f"🧠 **Agent → LLM** ({model})\n"
-                    f"Available tools sent to LLM: {', '.join(tool_names)}\n"
-                    f"Tokens: {input_tokens} input → {output_tokens} output\n"
-                    f"Duration: {duration_ms}ms"
-                ),
-                "type": "agent_to_llm",
-            })
-
-        # chat — individual LLM call (agent sending messages to model)
-        elif name == "chat" or name.startswith("chat "):
-            model = attrs.get("gen_ai.request.model", "")
-            input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-            output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-            ttft = attrs.get("gen_ai.server.time_to_first_token", "")
-            request_duration = attrs.get("gen_ai.server.request.duration", "")
-
-            messages.append({
-                "timestamp": timestamp,
-                "role": "llm",
-                "content": (
-                    f"💬 **LLM Call** → `{model}`\n"
-                    f"Messages sent: {input_tokens} tokens\n"
-                    f"LLM response: {output_tokens} tokens\n"
-                    f"TTFT: {ttft}ms | Request duration: {request_duration}ms | Total: {duration_ms}ms"
-                ),
-                "type": "llm_call",
-            })
-
-        # execute_event_loop_cycle — agent reasoning cycle
-        elif name == "execute_event_loop_cycle":
-            messages.append({
-                "timestamp": timestamp,
-                "role": "system",
-                "content": f"🔄 **Agent Event Loop Cycle** ({duration_ms}ms)",
-                "type": "event_loop",
-            })
-
-        # Gateway/HTTP calls (tool execution via gateway)
-        elif kind == "CLIENT" and ("POST" in name or "GET" in name) and "invocations" not in name:
-            url = attrs.get("http.url", attrs.get("http.target", name))
-            status_code = attrs.get("http.status_code", attrs.get("http.response.status_code", ""))
-            remote_service = attrs.get("aws.remote.service", "")
-            remote_op = attrs.get("aws.remote.operation", "")
-
-            if remote_service and remote_op:
-                desc = f"{remote_service}.{remote_op}"
-            else:
-                desc = url[:100] if url else name
-
-            status_icon = "✅" if str(status_code).startswith("2") else "❌"
-            messages.append({
-                "timestamp": timestamp,
-                "role": "gateway",
-                "content": (
-                    f"🌐 **Gateway Call**: {desc}\n"
-                    f"Status: {status_icon} {status_code} | Duration: {duration_ms}ms"
-                ),
-                "type": "gateway_call",
-            })
-
-        # Bedrock Runtime calls (CountTokens, Converse, etc.)
-        elif kind == "CLIENT" and "Bedrock" in name:
-            remote_op = attrs.get("aws.remote.operation", attrs.get("rpc.method", ""))
-            status_code = attrs.get("http.status_code", "")
-            status_icon = "✅" if str(status_code).startswith("2") else "❌"
-
-            messages.append({
-                "timestamp": timestamp,
-                "role": "llm",
-                "content": (
-                    f"☁️ **AWS API**: {name}\n"
-                    f"Operation: {remote_op} | Status: {status_icon} {status_code} | Duration: {duration_ms}ms"
-                ),
-                "type": "aws_api_call",
-            })
-
-            # Add exceptions
-            for evt in events:
-                evt_attrs = evt.get("attributes", {})
-                if evt_attrs.get("exception.type"):
-                    messages.append({
-                        "timestamp": timestamp,
-                        "role": "error",
-                        "content": (
-                            f"❌ **{evt_attrs.get('exception.type', '')}**\n"
-                            f"{evt_attrs.get('exception.message', '')[:400]}"
-                        ),
-                        "type": "error",
-                    })
-
-    return messages
-
-
-def load_conversation_from_spans(region, session_id, start_time, end_time):
-    """Fallback: reconstruct conversation timeline from aws/spans."""
-    client = boto3.client("logs", region_name=region)
-
-    query = f"""
-        fields @timestamp, @message
-        | filter @message like /"{session_id}"/
-        | sort @timestamp asc
-        | limit 1000
-    """.strip()
-
-    response = client.start_query(
-        logGroupNames=[LOG_GROUPS["spans"]],
-        startTime=start_time,
-        endTime=end_time,
-        queryString=query,
-    )
-    query_id = response["queryId"]
-
-    status = "Running"
-    results = []
-    while status in ("Running", "Scheduled"):
-        time.sleep(1)
-        result = client.get_query_results(queryId=query_id)
-        status = result.get("status", "Unknown")
-        results = result.get("results", [])
-
-    spans = []
-    for row in results:
-        message = ""
-        timestamp = ""
-        for field in row:
-            if field["field"] == "@message":
-                message = field["value"]
-            elif field["field"] == "@timestamp":
-                timestamp = field["value"]
-        if message:
-            try:
-                span_data = json.loads(message)
-                span_data["_timestamp"] = timestamp
-                spans.append(span_data)
-            except json.JSONDecodeError:
-                continue
-
-    spans.sort(key=lambda s: s.get("startTimeUnixNano", 0))
-    return build_conversation_from_spans(spans)
-
-
-def build_conversation_from_spans(spans):
-    """Build a chat-like conversation timeline from OTEL spans."""
-    conversation = []
-    invocation_num = 0
-
-    for span in spans:
-        name = span.get("name", "")
-        kind = span.get("kind", "")
-        attrs = span.get("attributes", {})
-        events = span.get("events", [])
-        duration_ns = span.get("durationNano", 0)
-        duration_ms = round(duration_ns / 1_000_000, 1)
-        timestamp = span.get("_timestamp", "")
-        status_code = span.get("status", {}).get("code", "")
-
-        # 1. Runtime Invoke — marks a new user turn
-        if name == "AgentCore.Runtime.Invoke":
-            invocation_num += 1
-            conversation.append({
-                "timestamp": timestamp,
-                "role": "user",
-                "content": f"User request #{invocation_num}",
-                "type": "request",
-                "duration": duration_ms,
-            })
-
-        # 2. invoke_agent — full agent cycle with model & token info
-        elif "invoke_agent" in name:
-            model = attrs.get("gen_ai.request.model", "unknown")
-            input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-            output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-            tools_raw = attrs.get("gen_ai.agent.tools", "[]")
-            try:
-                tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-            except Exception:
-                tools = []
-            # Clean tool names (remove gateway prefix)
-            tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
-
-            conversation.append({
-                "timestamp": timestamp,
-                "role": "assistant",
-                "content": (
-                    f"🧠 Agent invoked\n"
-                    f"Model: {model}\n"
-                    f"Tools available: {', '.join(tool_names[:6])}\n"
-                    f"Tokens: {input_tokens} input → {output_tokens} output\n"
-                    f"Duration: {duration_ms}ms"
-                ),
-                "type": "agent",
-                "duration": duration_ms,
-            })
-
-        # 3. chat — LLM thinking step
-        elif name == "chat" or name.startswith("chat "):
-            model = attrs.get("gen_ai.request.model", "")
-            input_tokens = attrs.get("gen_ai.usage.input_tokens", 0)
-            output_tokens = attrs.get("gen_ai.usage.output_tokens", 0)
-            ttft = attrs.get("gen_ai.server.time_to_first_token", "")
-
-            conversation.append({
-                "timestamp": timestamp,
-                "role": "assistant",
-                "content": (
-                    f"🧠 Thinking... ({model})\n"
-                    f"Generated {output_tokens} tokens in {duration_ms}ms"
-                    + (f" (TTFT: {ttft}ms)" if ttft else "")
-                ),
-                "type": "thinking",
-                "duration": duration_ms,
-            })
-
-        # 4. execute_tool — tool call
-        elif "execute_tool" in name:
-            tool_name = attrs.get("gen_ai.tool.name", name.replace("execute_tool ", ""))
-            tool_status = attrs.get("gen_ai.tool.status", "unknown")
-            tool_desc = attrs.get("gen_ai.tool.description", "")[:120]
-
-            icon = "✅" if tool_status == "success" else "❌"
-            content = f"{icon} Called tool: **{tool_name}**\nDuration: {duration_ms}ms"
-            if tool_desc:
-                content += f"\n_{tool_desc}_"
-
-            conversation.append({
-                "timestamp": timestamp,
-                "role": "tool",
-                "content": content,
-                "type": "tool_call",
-                "duration": duration_ms,
-            })
-
-            # Add error details if present
-            for evt in events:
-                evt_attrs = evt.get("attributes", {})
-                if evt_attrs.get("exception.type"):
-                    conversation.append({
-                        "timestamp": timestamp,
-                        "role": "error",
-                        "content": (
-                            f"❌ {evt_attrs.get('exception.type', '')}\n"
-                            f"{evt_attrs.get('exception.message', '')[:300]}"
-                        ),
-                        "type": "error",
-                    })
-
-        # 5. POST /invocations — response being sent back
-        elif name == "POST /invocations" and kind == "SERVER":
-            conversation.append({
-                "timestamp": timestamp,
-                "role": "assistant",
-                "content": f"📤 Response sent to user ({duration_ms}ms total processing)",
-                "type": "response",
-                "duration": duration_ms,
-            })
-
-    return conversation
-
-
 @app.route("/api/sessions/<session_id>/spans")
 def get_session_spans(session_id):
-    region = request.args.get("region", "us-east-1")
+    region = require_region()
     start_time = int(request.args.get("startTime", int(time.time()) - 2592000))
     end_time = int(request.args.get("endTime", int(time.time())))
 
@@ -2768,7 +1922,7 @@ def get_session_spans(session_id):
 @app.route("/api/sessions/<session_id>/metrics")
 def get_session_metrics(session_id):
     """Compute session-level metrics from spans for developers, PMs, and architects."""
-    region = request.args.get("region", "us-east-1")
+    region = require_region()
     start_time = int(request.args.get("startTime", int(time.time()) - 2592000))
     end_time = int(request.args.get("endTime", int(time.time())))
 
@@ -2964,4 +2118,4 @@ def get_session_metrics(session_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0",port=3000)
+    app.run(debug=True, host="0.0.0.0", port=3000)
