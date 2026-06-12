@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 from flask import Flask, render_template, jsonify, request
@@ -24,14 +25,32 @@ for model_id, prices in PRICING_CONFIG.get("models", {}).items():
     }
 
 
+_CROSS_REGION_PREFIXES = ("us.", "global.", "eu.", "apac.", "us-gov.")
+
+
+def _normalize_model_id(model_id):
+    """Strip cross-region inference prefixes so 'us.anthropic.claude-...' matches 'anthropic.claude-...'."""
+    for prefix in _CROSS_REGION_PREFIXES:
+        if model_id.startswith(prefix):
+            return model_id[len(prefix):]
+    return model_id
+
+
 def get_model_pricing(model_id):
-    """Get pricing for a model. Falls back to default if not found."""
+    """Get pricing for a model. Tries exact match, then a normalized cross-region match."""
     if model_id in BEDROCK_PRICING:
         return BEDROCK_PRICING[model_id]
-    # Try partial match
+
+    # Try matching after stripping cross-region prefix on either side.
+    normalized = _normalize_model_id(model_id)
+    if normalized in BEDROCK_PRICING:
+        return BEDROCK_PRICING[normalized]
     for key, pricing in BEDROCK_PRICING.items():
-        if key in model_id or model_id in key:
+        if key == "_default":
+            continue
+        if _normalize_model_id(key) == normalized:
             return pricing
+
     return BEDROCK_PRICING.get("_default", {"input": 0.001, "output": 0.004})
 
 
@@ -118,112 +137,152 @@ def get_pricing():
     })
 
 
+_USAGETYPE_REGION_PREFIX_RE = re.compile(r"^[A-Z]{2,4}\d?-")
+_TOKEN_SUFFIX_RE = re.compile(
+    r"-(?:Input|Output|Inp|Outp|InputTokens|OutputTokens|Inp-Tokens|Outp-Tokens|Input-Tokens|Output-Tokens)$",
+    re.IGNORECASE,
+)
+
+
+def _classify_token_direction(*candidates):
+    """Return 'input', 'output', or None given a bag of strings (group, usagetype, feature, description)."""
+    blob = " ".join(c for c in candidates if c).lower()
+    # Order matters: 'output' check first since 'input' substring can appear elsewhere ambiguously
+    if "output" in blob or "outp-tokens" in blob or blob.endswith("-outp"):
+        return "output"
+    if "input" in blob or "inp-tokens" in blob or blob.endswith("-inp"):
+        return "input"
+    return None
+
+
+def _extract_model_id_from_usagetype(usagetype):
+    """Strip region prefix and Input/Output suffix from a usagetype to recover the bedrock model id."""
+    if not usagetype:
+        return ""
+    stripped = _USAGETYPE_REGION_PREFIX_RE.sub("", usagetype, count=1)
+    stripped = _TOKEN_SUFFIX_RE.sub("", stripped)
+    return stripped
+
+
+def _normalize_to_per_1k(price_per_unit, unit):
+    """Convert a Pricing API price to per-1K tokens regardless of the source unit."""
+    unit_lower = (unit or "").lower()
+    # Common units: '1K tokens', 'tokens', '1000 tokens', '1M tokens'
+    if "1m" in unit_lower or "1,000,000" in unit_lower or "million" in unit_lower:
+        return price_per_unit / 1000.0
+    if "1k" in unit_lower or "1000" in unit_lower or "1,000" in unit_lower:
+        return price_per_unit
+    if "token" in unit_lower:
+        # Per-token pricing — scale up to per-1K
+        return price_per_unit * 1000.0
+    # Unknown unit; assume per-1K to avoid wildly wrong answers from a bad scale
+    return price_per_unit
+
+
 @app.route("/api/pricing/refresh", methods=["POST"])
 def refresh_pricing():
     """Fetch latest pricing from AWS Price List API and update config."""
     try:
-        # AWS Pricing API is only available in us-east-1
+        # AWS Pricing API is only available in us-east-1 / ap-south-1
         pricing_client = boto3.client("pricing", region_name="us-east-1")
 
         updated_models = {}
+        items_seen = 0
+        items_classified = 0
         next_token = None
 
-        # Query Bedrock pricing
         while True:
-            params = {
-                "ServiceCode": "AmazonBedrock",
-                "Filters": [
-                    {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Machine Learning"},
-                ],
-                "MaxResults": 100,
-            }
+            params = {"ServiceCode": "AmazonBedrock", "MaxResults": 100}
             if next_token:
                 params["NextToken"] = next_token
 
             response = pricing_client.get_products(**params)
 
             for price_item_str in response.get("PriceList", []):
-                price_item = json.loads(price_item_str) if isinstance(price_item_str, str) else price_item_str
+                items_seen += 1
+                try:
+                    price_item = json.loads(price_item_str) if isinstance(price_item_str, str) else price_item_str
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
                 product = price_item.get("product", {})
                 attributes = product.get("attributes", {})
                 terms = price_item.get("terms", {}).get("OnDemand", {})
 
-                model_id = attributes.get("usagetype", "")
+                usagetype = attributes.get("usagetype", "")
                 group = attributes.get("group", "")
+                feature = attributes.get("feature", "")
+                description = attributes.get("usageDescription", "") or attributes.get("operation", "")
                 region_code = attributes.get("regionCode", "")
 
-                # Only process input/output token pricing
-                if not ("Input" in group or "Output" in group):
+                direction = _classify_token_direction(group, usagetype, feature, description)
+                if direction is None:
                     continue
+                # Only us-east-1 anchor pricing — Bedrock on-demand pricing is region-keyed
                 if region_code and region_code != "us-east-1":
                     continue
 
-                # Extract the model name from usagetype
-                # Format: "USE1-<ModelPrefix>-Input-Tokens" or similar
-                model_prefix = ""
-                for attr_key in ["model", "modelId"]:
-                    if attr_key in attributes:
-                        model_prefix = attributes[attr_key]
-                        break
-
-                if not model_prefix:
+                # Prefer explicit model attributes, fall back to parsing usagetype.
+                model_id = (
+                    attributes.get("model")
+                    or attributes.get("modelId")
+                    or _extract_model_id_from_usagetype(usagetype)
+                )
+                if not model_id:
                     continue
 
-                # Get the price per unit
-                for term_key, term_val in terms.items():
-                    price_dimensions = term_val.get("priceDimensions", {})
-                    for dim_key, dim_val in price_dimensions.items():
-                        price_per_unit = float(dim_val.get("pricePerUnit", {}).get("USD", "0"))
-                        unit = dim_val.get("unit", "")
+                for term_val in terms.values():
+                    for dim_val in term_val.get("priceDimensions", {}).values():
+                        try:
+                            price_per_unit = float(dim_val.get("pricePerUnit", {}).get("USD", "0"))
+                        except (TypeError, ValueError):
+                            continue
+                        if price_per_unit <= 0:
+                            continue
 
-                        if price_per_unit > 0:
-                            if model_prefix not in updated_models:
-                                updated_models[model_prefix] = {}
-
-                            # Convert to per-1K tokens
-                            if "1000" in unit or "1K" in unit:
-                                price_per_1k = price_per_unit
-                            else:
-                                price_per_1k = price_per_unit * 1000
-
-                            if "Input" in group:
-                                updated_models[model_prefix]["input_per_1k"] = price_per_1k
-                            elif "Output" in group:
-                                updated_models[model_prefix]["output_per_1k"] = price_per_1k
+                        price_per_1k = _normalize_to_per_1k(price_per_unit, dim_val.get("unit", ""))
+                        slot = updated_models.setdefault(model_id, {})
+                        slot[f"{direction}_per_1k"] = price_per_1k
+                        items_classified += 1
 
             next_token = response.get("NextToken")
             if not next_token:
                 break
 
-        # Merge with existing pricing (keep existing entries, update/add new ones)
+        # Merge: only adopt entries that have BOTH input and output prices.
         existing_models = PRICING_CONFIG.get("models", {})
-        if updated_models:
-            for model_id, prices in updated_models.items():
-                if "input_per_1k" in prices and "output_per_1k" in prices:
-                    existing_models[model_id] = prices
+        merged_count = 0
+        for model_id, prices in updated_models.items():
+            if "input_per_1k" in prices and "output_per_1k" in prices:
+                existing_models[model_id] = prices
+                merged_count += 1
 
-        # Update config
         from datetime import date
         PRICING_CONFIG["models"] = existing_models
         PRICING_CONFIG["last_updated"] = date.today().isoformat()
         CONFIG["pricing"] = PRICING_CONFIG
 
-        # Rebuild runtime pricing lookup
         global BEDROCK_PRICING
-        BEDROCK_PRICING = {}
-        for model_id, prices in existing_models.items():
-            BEDROCK_PRICING[model_id] = {
-                "input": prices["input_per_1k"],
-                "output": prices["output_per_1k"],
-            }
+        BEDROCK_PRICING = {
+            mid: {"input": p["input_per_1k"], "output": p["output_per_1k"]}
+            for mid, p in existing_models.items()
+            if "input_per_1k" in p and "output_per_1k" in p
+        }
 
-        # Save to file
         with open(CONFIG_PATH, "w") as f:
             json.dump(CONFIG, f, indent=2)
 
         return jsonify({
             "status": "ok",
-            "message": f"Pricing updated. {len(updated_models)} models fetched from AWS, {len(existing_models)} total models in config.",
+            "message": (
+                f"Pricing refresh complete. Scanned {items_seen} price items, "
+                f"classified {items_classified} input/output entries, "
+                f"merged {merged_count} models with full pricing. "
+                f"{len(existing_models)} total models in config."
+            ),
+            "items_seen": items_seen,
+            "items_classified": items_classified,
+            "models_merged": merged_count,
             "last_updated": PRICING_CONFIG["last_updated"],
             "models_count": len(existing_models),
         })
@@ -346,12 +405,14 @@ def get_summary():
         except Exception:
             pass
 
-        # Process span results into summary
+        # Process span results into summary. Each row is grouped by (service, model),
+        # so we cost each row with its own model's pricing — no per-agent pricing fudge.
         total_input_tokens = 0
         total_output_tokens = 0
         total_sessions = set()
         models_usage = {}
         agents_activity = {}
+        cost_by_agent = {}
 
         for row in results:
             record = {}
@@ -368,67 +429,74 @@ def get_summary():
             total_input_tokens += input_tokens
             total_output_tokens += output_tokens
 
-            if model and model != "":
-                if model not in models_usage:
-                    models_usage[model] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
-                models_usage[model]["input_tokens"] += input_tokens
-                models_usage[model]["output_tokens"] += output_tokens
-                models_usage[model]["calls"] += spans
+            row_pricing = get_model_pricing(model) if model else BEDROCK_PRICING.get(
+                "_default", {"input": 0.001, "output": 0.004}
+            )
+            row_input_cost = (input_tokens / 1000) * row_pricing["input"]
+            row_output_cost = (output_tokens / 1000) * row_pricing["output"]
+            row_cost = row_input_cost + row_output_cost
+
+            if model:
+                bucket = models_usage.setdefault(
+                    model,
+                    {"input_tokens": 0, "output_tokens": 0, "calls": 0, "input_cost": 0, "output_cost": 0},
+                )
+                bucket["input_tokens"] += input_tokens
+                bucket["output_tokens"] += output_tokens
+                bucket["calls"] += spans
+                bucket["input_cost"] += row_input_cost
+                bucket["output_cost"] += row_output_cost
 
             if service:
                 agent_name = service.replace(".DEFAULT", "")
-                if agent_name not in agents_activity:
-                    agents_activity[agent_name] = {"spans": 0, "input_tokens": 0, "output_tokens": 0, "models": set()}
-                agents_activity[agent_name]["spans"] += spans
-                agents_activity[agent_name]["input_tokens"] += input_tokens
-                agents_activity[agent_name]["output_tokens"] += output_tokens
+                activity = agents_activity.setdefault(
+                    agent_name,
+                    {"spans": 0, "input_tokens": 0, "output_tokens": 0, "models": set()},
+                )
+                activity["spans"] += spans
+                activity["input_tokens"] += input_tokens
+                activity["output_tokens"] += output_tokens
                 if model:
-                    agents_activity[agent_name]["models"].add(model)
+                    activity["models"].add(model)
 
-        # Calculate costs per model
+                agent_cost = cost_by_agent.setdefault(
+                    agent_name,
+                    {"models": set(), "input_tokens": 0, "output_tokens": 0,
+                     "input_cost": 0, "output_cost": 0, "total_cost": 0},
+                )
+                if model:
+                    agent_cost["models"].add(model)
+                agent_cost["input_tokens"] += input_tokens
+                agent_cost["output_tokens"] += output_tokens
+                agent_cost["input_cost"] += row_input_cost
+                agent_cost["output_cost"] += row_output_cost
+                agent_cost["total_cost"] += row_cost
+
+        # Finalize per-model cost rollups
         total_cost = 0
         cost_by_model = {}
         for model, usage in models_usage.items():
-            pricing = get_model_pricing(model)
-            input_cost = (usage["input_tokens"] / 1000) * pricing["input"]
-            output_cost = (usage["output_tokens"] / 1000) * pricing["output"]
-            model_cost = input_cost + output_cost
+            model_cost = usage["input_cost"] + usage["output_cost"]
             total_cost += model_cost
             cost_by_model[model] = {
                 "input_tokens": usage["input_tokens"],
                 "output_tokens": usage["output_tokens"],
                 "calls": usage["calls"],
-                "input_cost": round(input_cost, 6),
-                "output_cost": round(output_cost, 6),
+                "input_cost": round(usage["input_cost"], 6),
+                "output_cost": round(usage["output_cost"], 6),
                 "total_cost": round(model_cost, 6),
-                "pricing": pricing,
+                "pricing": get_model_pricing(model),
             }
 
-        # Calculate cost per agent
-        cost_by_agent = {}
-        for agent_name, activity in agents_activity.items():
-            models = list(activity.get("models", set()))
-            # Use the first model for pricing, or average across models
-            if models:
-                # Calculate weighted cost across all models the agent used
-                # Since we don't have per-model-per-agent token breakdown,
-                # use the primary (first) model's pricing as best estimate
-                pricing = get_model_pricing(models[0])
-            else:
-                pricing = BEDROCK_PRICING.get("_default", {"input": 0.001, "output": 0.004})
-            input_cost = (activity["input_tokens"] / 1000) * pricing["input"]
-            output_cost = (activity["output_tokens"] / 1000) * pricing["output"]
-            agent_cost = input_cost + output_cost
-            cost_by_agent[agent_name] = {
-                "models": models,
-                "input_tokens": activity["input_tokens"],
-                "output_tokens": activity["output_tokens"],
-                "input_cost": round(input_cost, 6),
-                "output_cost": round(output_cost, 6),
-                "total_cost": round(agent_cost, 6),
-            }
-            # Convert set to list for JSON serialization
-            activity["models"] = models
+        # Finalize per-agent costs (sets → lists for JSON, round numbers)
+        for agent_name, agent_cost in cost_by_agent.items():
+            agent_cost["models"] = sorted(agent_cost["models"])
+            agent_cost["input_cost"] = round(agent_cost["input_cost"], 6)
+            agent_cost["output_cost"] = round(agent_cost["output_cost"], 6)
+            agent_cost["total_cost"] = round(agent_cost["total_cost"], 6)
+
+        for activity in agents_activity.values():
+            activity["models"] = sorted(activity["models"])
 
         # Separate agents by type (MCP vs HTTP)
         mcp_agents = [a for a in all_agents if any(k in a["name"].lower() for k in ["mcp", "server"])]
@@ -805,27 +873,36 @@ def get_session_conversation(session_id):
         if memory_id and actor_id:
             event_messages = load_conversation_from_events(region, memory_id, actor_id, session_id)
 
-        # Build clean narrative from spans + events
-        conversation = build_clean_narrative(spans, event_messages)
-
         # Always try agent runtime logs for the actual conversation content
         # (spans only give us metadata like model, tokens, duration - not the messages)
         runtime_conversation = load_conversation_from_runtime_logs(
             region, agent_id, session_id, start_time, end_time
         )
-        if runtime_conversation:
-            # If we got runtime logs with user/assistant messages, use them
-            has_content = any(
-                s.get("style") in ("user", "assistant") for s in runtime_conversation
-            )
-            if has_content:
-                conversation = runtime_conversation
+
+        view = request.args.get("view", "actor_flow")  # "actor_flow" | "messages" | "legacy"
+
+        if view == "actor_flow" and spans:
+            conversation = build_actor_flow_narrative(spans, runtime_conversation)
+            # If span data was thin and the flow is empty, fall back to message view
+            if not conversation:
+                conversation = runtime_conversation or build_clean_narrative(spans, event_messages)
+        elif view == "messages" and runtime_conversation:
+            conversation = runtime_conversation
+        else:
+            conversation = build_clean_narrative(spans, event_messages)
+            if runtime_conversation:
+                has_content = any(
+                    s.get("style") in ("user", "assistant") for s in runtime_conversation
+                )
+                if has_content:
+                    conversation = runtime_conversation
 
         return jsonify({
             "conversation": conversation,
             "sessionId": session_id,
             "actorId": actor_id,
             "memoryId": memory_id,
+            "view": view,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1046,17 +1123,57 @@ def parse_otel_runtime_logs(results):
                         "style": "user",
                     })
             elif role == "tool":
-                msg_key = f"tool_input:{text[:100]}"
-                if msg_key not in seen_messages:
+                # role=tool input messages come in two shapes:
+                #   Shape A — tool call echo (replay of the LLM's prior toolUse as context):
+                #       content.content is the INPUT JSON of the call, content.id is set.
+                #       The tool_call entry already shows this input — skip to avoid mislabeling.
+                #   Shape B — actual tool result: content.content is a JSON array of
+                #       toolResult blocks. Render each, deduped by toolUseId.
+                inner = msg.get("content", {})
+                inner_payload = inner.get("content", "") if isinstance(inner, dict) else ""
+
+                tool_blocks = []
+                if isinstance(inner_payload, str):
+                    try:
+                        parsed = json.loads(inner_payload)
+                        if isinstance(parsed, list):
+                            tool_blocks = [b for b in parsed if isinstance(b, dict) and "toolResult" in b]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                if not tool_blocks:
+                    # Shape A or unrecognized — drop, the tool_call carries the input already
+                    continue
+
+                for block in tool_blocks:
+                    tr = block["toolResult"]
+                    tool_use_id = tr.get("toolUseId", "")
+                    msg_key = f"tool_result:{tool_use_id}" if tool_use_id else f"tool_result:{json.dumps(tr)[:200]}"
+                    if msg_key in seen_messages:
+                        continue
                     seen_messages.add(msg_key)
-                    tool_text = _parse_tool_result_text(text)
+
+                    text_parts = []
+                    for c in tr.get("content", []):
+                        if isinstance(c, dict) and "text" in c:
+                            text_parts.append(c["text"])
+                    result_text = "\n".join(text_parts) if text_parts else json.dumps(tr.get("content", ""), indent=2)
+                    # Pretty-print JSON if possible
+                    try:
+                        result_text = json.dumps(json.loads(result_text), indent=2)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    status_str = tr.get("status", "success")
+                    icon = "✅" if status_str == "success" else "❌"
                     conversation.append({
                         "timestamp": timestamp,
                         "step": "tool_result",
-                        "title": "Tool Result",
-                        "content": tool_text,
-                        "icon": "\U0001f4e5",
-                        "style": "tool_result",
+                        "title": f"Tool Result ({status_str})",
+                        "content": result_text,
+                        "icon": icon,
+                        "style": "tool_result" if status_str == "success" else "error",
+                        "tool_use_id": tool_use_id,
                     })
 
         # Extract assistant responses from output
@@ -1075,7 +1192,13 @@ def parse_otel_runtime_logs(results):
                     parsed = _parse_content_blocks(message_text)
                     for block in parsed:
                         if block["type"] == "text":
-                            msg_key = f"assistant:{block['text'][:100]}"
+                            # Suppress assistant "text" blocks that are actually JSON
+                            # echoes of prior tool results / toolResult arrays. Real
+                            # agent prose is plain text, never starts with { or [.
+                            stripped = block["text"].lstrip()
+                            if stripped.startswith(("{", "[")):
+                                continue
+                            msg_key = f"assistant:{block['text'][:200]}"
                             if msg_key not in seen_messages:
                                 seen_messages.add(msg_key)
                                 conversation.append({
@@ -1083,47 +1206,107 @@ def parse_otel_runtime_logs(results):
                                     "step": "assistant",
                                     "title": "Agent",
                                     "content": block["text"],
-                                    "icon": "\U0001f916",
+                                    "icon": "🤖",
                                     "style": "assistant",
                                 })
                         elif block["type"] == "tool_use":
-                            msg_key = f"tool_call:{block['name']}:{str(block.get('input', ''))[:50]}"
+                            tool_use_id = block.get("toolUseId", "")
+                            if tool_use_id:
+                                msg_key = f"tool_call:{tool_use_id}"
+                            else:
+                                msg_key = f"tool_call:{block['name']}:{str(block.get('input', ''))[:50]}"
                             if msg_key not in seen_messages:
                                 seen_messages.add(msg_key)
                                 tool_input = block.get("input", "")
                                 if isinstance(tool_input, dict):
-                                    tool_input = json.dumps(tool_input)
+                                    tool_input = json.dumps(tool_input, indent=2)
                                 conversation.append({
                                     "timestamp": timestamp,
                                     "step": "tool_call",
                                     "title": f"Tool: {block['name']}",
                                     "content": f"**{block['name']}**\n```json\n{tool_input}\n```",
-                                    "icon": "\U0001f527",
+                                    "icon": "🔧",
                                     "style": "tool_call",
+                                    "tool_use_id": tool_use_id,
+                                    "tool_name": block.get("name", ""),
                                 })
 
-                # Check for tool.result in content
+                # Check for tool.result in content (some SDKs put results on the assistant turn)
                 tool_result_text = content_raw.get("tool.result", "")
                 if tool_result_text:
                     parsed_results = _parse_content_blocks(tool_result_text)
                     for block in parsed_results:
                         if block["type"] == "tool_result":
-                            msg_key = f"tool_result:{block.get('text', '')[:100]}"
+                            tool_use_id = block.get("toolUseId", "")
+                            msg_key = (
+                                f"tool_result:{tool_use_id}" if tool_use_id
+                                else f"tool_result:{block.get('text', '')[:200]}"
+                            )
                             if msg_key not in seen_messages:
                                 seen_messages.add(msg_key)
                                 status_str = block.get("status", "success")
                                 icon = "\u2705" if status_str == "success" else "\u274c"
+                                # Pretty-print JSON results when possible
+                                result_text = block.get("text", "")
+                                try:
+                                    result_text = json.dumps(json.loads(result_text), indent=2)
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
                                 conversation.append({
                                     "timestamp": timestamp,
                                     "step": "tool_result",
                                     "title": f"Tool Result ({status_str})",
-                                    "content": block.get("text", ""),
+                                    "content": result_text,
                                     "icon": icon,
-                                    "style": "tool_result",
+                                    "style": "tool_result" if status_str == "success" else "error",
+                                    "tool_use_id": tool_use_id,
                                 })
 
             elif isinstance(content_raw, str):
-                msg_key = f"assistant:{content_raw[:100]}"
+                # If the raw string is a JSON array of toolResult blocks, parse them
+                # as tool results rather than rendering as Agent text.
+                stripped = content_raw.lstrip()
+                if stripped.startswith("[") and "toolResult" in stripped[:80]:
+                    try:
+                        parsed_arr = json.loads(content_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_arr = []
+                    for block in parsed_arr if isinstance(parsed_arr, list) else []:
+                        if not isinstance(block, dict) or "toolResult" not in block:
+                            continue
+                        tr = block["toolResult"]
+                        tool_use_id = tr.get("toolUseId", "")
+                        msg_key = f"tool_result:{tool_use_id}" if tool_use_id else f"tool_result:{json.dumps(tr)[:200]}"
+                        if msg_key in seen_messages:
+                            continue
+                        seen_messages.add(msg_key)
+                        text_parts = []
+                        for c in tr.get("content", []):
+                            if isinstance(c, dict) and "text" in c:
+                                text_parts.append(c["text"])
+                        result_text = "\n".join(text_parts) if text_parts else json.dumps(tr.get("content", ""), indent=2)
+                        try:
+                            result_text = json.dumps(json.loads(result_text), indent=2)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        status_str = tr.get("status", "success")
+                        icon = "✅" if status_str == "success" else "❌"
+                        conversation.append({
+                            "timestamp": timestamp,
+                            "step": "tool_result",
+                            "title": f"Tool Result ({status_str})",
+                            "content": result_text,
+                            "icon": icon,
+                            "style": "tool_result" if status_str == "success" else "error",
+                            "tool_use_id": tool_use_id,
+                        })
+                    continue
+
+                # Skip JSON-shaped strings that are tool-result echoes, not real prose
+                if stripped.startswith(("{", "[")):
+                    continue
+
+                msg_key = f"assistant:{content_raw[:200]}"
                 if msg_key not in seen_messages:
                     seen_messages.add(msg_key)
                     conversation.append({
@@ -1131,7 +1314,7 @@ def parse_otel_runtime_logs(results):
                         "step": "assistant",
                         "title": "Agent",
                         "content": content_raw,
-                        "icon": "\U0001f916",
+                        "icon": "🤖",
                         "style": "assistant",
                     })
 
@@ -1245,6 +1428,443 @@ def _parse_tool_result_text(text):
     return text
 
 
+def _extract_invocations_from_spans(spans):
+    """Group spans into per-invocation buckets by time-window of AgentCore.Runtime.Invoke (or invoke_agent).
+
+    Returns a list of dicts:
+        {
+          "start_ns": int, "end_ns": int, "timestamp": str, "duration_ms": float,
+          "model": str, "tools_available": [str], "input_tokens": int, "output_tokens": int,
+          "gateway_init": [{"path": str, "host": str, "status": str, "duration_ms": float}],
+          "rounds": [
+              {
+                "llm": {"model","input_tokens","output_tokens","ttft_ms","duration_ms"},
+                "tool": {"name","status","input","duration_ms","gateway_status","gateway_duration_ms"} or None,
+                "errors": [str]
+              }
+          ]
+        }
+    """
+    if not spans:
+        return []
+
+    # Prefer AgentCore.Runtime.Invoke as the root. Strands invoke_agent is a CHILD
+    # of Runtime.Invoke, so we only fall back to invoke_agent when there's no AgentCore root.
+    runtime_roots = [s for s in spans if s.get("name") == "AgentCore.Runtime.Invoke"]
+    if runtime_roots:
+        roots = runtime_roots
+    else:
+        roots = [
+            s for s in spans
+            if s.get("name", "").startswith("invoke_agent")
+            and s.get("attributes", {}).get("gen_ai.agent.tools")
+        ]
+
+    invocations = []
+    for root in roots:
+        start_ns = root.get("startTimeUnixNano", 0)
+        end_ns = root.get("endTimeUnixNano", 0)
+        children = [
+            s for s in spans
+            if s is not root and start_ns <= s.get("startTimeUnixNano", 0) <= end_ns
+        ]
+        children.sort(key=lambda s: s.get("startTimeUnixNano", 0))
+
+        inv = {
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+            "timestamp": root.get("_timestamp", ""),
+            "duration_ms": round(root.get("durationNano", 0) / 1_000_000, 1),
+            "model": "",
+            "tools_available": [],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "gateway_init": [],
+            "rounds": [],
+        }
+
+        # Find the invoke_agent span (carries model + tools list + total tokens)
+        invoke_agent_span = None
+        for s in children:
+            if s.get("name", "").startswith("invoke_agent"):
+                invoke_agent_span = s
+                break
+        if root.get("name", "").startswith("invoke_agent") and not invoke_agent_span:
+            invoke_agent_span = root
+
+        if invoke_agent_span:
+            attrs = invoke_agent_span.get("attributes", {})
+            inv["model"] = attrs.get("gen_ai.request.model", "")
+            inv["input_tokens"] = attrs.get("gen_ai.usage.input_tokens", 0)
+            inv["output_tokens"] = attrs.get("gen_ai.usage.output_tokens", 0)
+            tools_raw = attrs.get("gen_ai.agent.tools", "[]")
+            try:
+                tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
+            except Exception:
+                tools = []
+            inv["tools_available"] = [t.split("___")[-1] if "___" in t else t for t in (tools or [])]
+            invoke_agent_start = invoke_agent_span.get("startTimeUnixNano", start_ns)
+        else:
+            invoke_agent_start = start_ns
+
+        # Pre-invoke_agent gateway POSTs = MCP initialization (Agent ↔ Gateway: list tools)
+        for s in children:
+            if s.get("startTimeUnixNano", 0) >= invoke_agent_start:
+                continue
+            if s.get("kind") != "CLIENT":
+                continue
+            name = s.get("name", "")
+            if not (name == "POST" or name.startswith("POST ") or name.startswith("GET")):
+                continue
+            url = s.get("attributes", {}).get("http.url", "") or s.get("attributes", {}).get("http.target", "")
+            if not ("gateway" in url or "mcp" in url):
+                continue
+            from urllib.parse import urlparse
+            parsed = urlparse(url) if url else None
+            inv["gateway_init"].append({
+                "host": parsed.hostname if parsed else "",
+                "path": parsed.path if parsed else "",
+                "status": str(s.get("attributes", {}).get("http.status_code", "")),
+                "duration_ms": round(s.get("durationNano", 0) / 1_000_000, 1),
+            })
+
+        # Build rounds: each round = a chat span (LLM call), optionally followed by execute_tool + gateway POST
+        chat_spans = [
+            s for s in children
+            if (s.get("name") == "chat" or s.get("name", "").startswith("chat "))
+            and s.get("kind") == "INTERNAL"
+            and s.get("startTimeUnixNano", 0) >= invoke_agent_start
+        ]
+        tool_spans = [
+            s for s in children
+            if "execute_tool" in s.get("name", "")
+            and s.get("startTimeUnixNano", 0) >= invoke_agent_start
+        ]
+
+        for chat in chat_spans:
+            attrs = chat.get("attributes", {})
+            chat_end = chat.get("endTimeUnixNano", 0)
+            # Find the next tool that starts after this chat ends, before the next chat
+            next_chat_start = None
+            for c2 in chat_spans:
+                if c2.get("startTimeUnixNano", 0) > chat.get("startTimeUnixNano", 0):
+                    next_chat_start = c2.get("startTimeUnixNano", 0)
+                    break
+            tool_for_round = None
+            for t in tool_spans:
+                t_start = t.get("startTimeUnixNano", 0)
+                if t_start <= chat_end:
+                    continue
+                if next_chat_start is not None and t_start >= next_chat_start:
+                    break
+                tool_for_round = t
+                break
+
+            round_entry = {
+                "llm": {
+                    "model": attrs.get("gen_ai.request.model", inv["model"]),
+                    "input_tokens": attrs.get("gen_ai.usage.input_tokens", 0),
+                    "output_tokens": attrs.get("gen_ai.usage.output_tokens", 0),
+                    "ttft_ms": attrs.get("gen_ai.server.time_to_first_token", ""),
+                    "duration_ms": round(chat.get("durationNano", 0) / 1_000_000, 1),
+                    "finish_reason": attrs.get("gen_ai.response.finish_reasons", ""),
+                },
+                "tool": None,
+                "errors": [],
+            }
+
+            if tool_for_round:
+                t_attrs = tool_for_round.get("attributes", {})
+                tool_name = t_attrs.get("gen_ai.tool.name", "")
+                display = tool_name.split("___")[-1] if "___" in tool_name else tool_name
+                # Find the matching gateway POST inside the execute_tool's time window
+                gateway = None
+                for s in children:
+                    if s.get("kind") != "CLIENT":
+                        continue
+                    n = s.get("name", "")
+                    if not (n == "POST" or n.startswith("POST ")):
+                        continue
+                    if (tool_for_round.get("startTimeUnixNano", 0)
+                            <= s.get("startTimeUnixNano", 0)
+                            <= tool_for_round.get("endTimeUnixNano", 0)):
+                        url = s.get("attributes", {}).get("http.url", "") or ""
+                        if "gateway" in url or "mcp" in url:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url) if url else None
+                            gateway = {
+                                "host": parsed.hostname if parsed else "",
+                                "path": parsed.path if parsed else "",
+                                "status": str(s.get("attributes", {}).get("http.status_code", "")),
+                                "duration_ms": round(s.get("durationNano", 0) / 1_000_000, 1),
+                            }
+                            break
+                round_entry["tool"] = {
+                    "name": display,
+                    "status": t_attrs.get("gen_ai.tool.status", ""),
+                    "tool_use_id": t_attrs.get("gen_ai.tool.call.id", ""),
+                    "duration_ms": round(tool_for_round.get("durationNano", 0) / 1_000_000, 1),
+                    "gateway": gateway,
+                }
+                # Capture exception events from execute_tool
+                for evt in tool_for_round.get("events", []):
+                    ea = evt.get("attributes", {})
+                    if ea.get("exception.type"):
+                        round_entry["errors"].append(
+                            f"{ea.get('exception.type', '')}: {ea.get('exception.message', '')[:300]}"
+                        )
+
+            inv["rounds"].append(round_entry)
+
+        invocations.append(inv)
+
+    invocations.sort(key=lambda i: i["start_ns"])
+    return invocations
+
+
+def _extract_user_and_assistant_turns(runtime_conversation):
+    """Pull out user messages and assistant final replies (skip tool_call/tool_result rows)."""
+    turns = []
+    for s in runtime_conversation or []:
+        style = s.get("style", "")
+        if style == "user":
+            turns.append({"role": "user", "content": s.get("content", ""), "timestamp": s.get("timestamp", "")})
+        elif style == "assistant":
+            turns.append({"role": "assistant", "content": s.get("content", ""), "timestamp": s.get("timestamp", "")})
+    return turns
+
+
+def _strip_user_context_wrapper(text):
+    """Strip the <user_context>...</user_context> envelope and 'Current customer message:' prefix the SDK adds."""
+    if not text:
+        return text
+    cleaned = re.sub(r"<user_context>.*?</user_context>\s*", "", text, flags=re.DOTALL)
+    m = re.search(r"Current customer message:\s*(.+)", cleaned, re.DOTALL)
+    if m:
+        cleaned = m.group(1)
+    return cleaned.strip()
+
+
+def build_actor_flow_narrative(spans, runtime_conversation):
+    """
+    Render the conversation as an explicit actor-flow timeline:
+        1. User → Agent
+        2. Agent → Gateway (list tools)            [if MCP init present]
+        3. Agent → LLM (which tool?)
+        4. LLM → Agent (use tool X)                [if LLM picked a tool]
+        5. Agent → Gateway (execute tool)          [if tool used]
+        6. Gateway → Agent (tool result)           [if tool used]
+        7. Agent → LLM (here's the result)         [next round]
+        8. LLM → Agent (final answer)
+        9. Agent → User
+    Multiple LLM↔tool rounds are rendered as repeated 3-6 cycles.
+    """
+    invocations = _extract_invocations_from_spans(spans)
+    turns = _extract_user_and_assistant_turns(runtime_conversation)
+
+    # Pair user messages and assistant replies to invocations in order.
+    user_turns = [t for t in turns if t["role"] == "user"]
+    assistant_turns = [t for t in turns if t["role"] == "assistant"]
+
+    steps = []
+    for idx, inv in enumerate(invocations):
+        ts = inv["timestamp"]
+        # 1. User → Agent
+        user_text = _strip_user_context_wrapper(user_turns[idx]["content"]) if idx < len(user_turns) else ""
+        if user_text:
+            steps.append({
+                "timestamp": user_turns[idx]["timestamp"] if idx < len(user_turns) else ts,
+                "step": "user_to_agent",
+                "title": "1️⃣ User → Agent",
+                "content": user_text,
+                "icon": "👤",
+                "style": "user",
+            })
+
+        # 2. Agent → Gateway (MCP init / list tools) — only on first invocation usually,
+        #    but emit per-invocation if the trace shows it.
+        if inv["gateway_init"]:
+            count = len(inv["gateway_init"])
+            total_ms = round(sum(g["duration_ms"] for g in inv["gateway_init"]), 1)
+            tools_list = inv["tools_available"]
+            content = (
+                f"Connected to MCP gateway and loaded {len(tools_list)} available tools.\n"
+                f"Tools: {', '.join(tools_list[:8])}"
+                + (f" (+{len(tools_list)-8} more)" if len(tools_list) > 8 else "")
+                + f"\n_{count} init requests, {total_ms}ms total_"
+            )
+            steps.append({
+                "timestamp": ts,
+                "step": "agent_to_gateway_init",
+                "title": "2️⃣ Agent → Gateway (list tools)",
+                "content": content,
+                "icon": "🌐",
+                "style": "gateway",
+            })
+
+        # 3-8. Iterate rounds: Agent→LLM, LLM→Agent, [Agent→Gateway, Gateway→Agent], next round...
+        rounds = inv["rounds"]
+        for r_idx, rnd in enumerate(rounds):
+            llm = rnd["llm"]
+            round_label = f" (round {r_idx + 1}/{len(rounds)})" if len(rounds) > 1 else ""
+
+            # 3. Agent → LLM
+            llm_in_content = (
+                f"Sent to **{llm['model'] or inv['model']}**\n"
+                f"Input: {llm['input_tokens']} tokens"
+            )
+            steps.append({
+                "timestamp": ts,
+                "step": "agent_to_llm",
+                "title": f"3️⃣ Agent → LLM{round_label}",
+                "content": llm_in_content,
+                "icon": "🧠",
+                "style": "llm",
+            })
+
+            # 4. LLM → Agent
+            tool = rnd["tool"]
+            ttft_str = f", TTFT {llm['ttft_ms']}ms" if llm["ttft_ms"] else ""
+            if tool:
+                llm_out_content = (
+                    f"LLM decided to call tool: **{tool['name']}**\n"
+                    f"Output: {llm['output_tokens']} tokens in {llm['duration_ms']}ms{ttft_str}"
+                )
+            else:
+                llm_out_content = (
+                    f"LLM produced final answer (no further tool calls).\n"
+                    f"Output: {llm['output_tokens']} tokens in {llm['duration_ms']}ms{ttft_str}"
+                )
+                if llm.get("finish_reason"):
+                    llm_out_content += f"\nFinish reason: {llm['finish_reason']}"
+            steps.append({
+                "timestamp": ts,
+                "step": "llm_to_agent",
+                "title": f"4️⃣ LLM → Agent{round_label}",
+                "content": llm_out_content,
+                "icon": "💬",
+                "style": "llm",
+            })
+
+            if tool:
+                # 5. Agent → Gateway (execute tool)
+                gw = tool.get("gateway") or {}
+                tool_input = _find_tool_input_in_runtime(runtime_conversation, tool.get("tool_use_id"), tool["name"])
+                input_block = (
+                    f"```json\n{tool_input}\n```\n" if tool_input else ""
+                )
+                steps.append({
+                    "timestamp": ts,
+                    "step": "agent_to_gateway_exec",
+                    "title": f"5️⃣ Agent → Gateway (execute {tool['name']})",
+                    "content": (
+                        f"Executing tool **{tool['name']}** via MCP gateway\n"
+                        + input_block
+                        + (f"_Gateway: {gw.get('host','')} | POST {gw.get('path','')}_" if gw else "")
+                    ),
+                    "icon": "🔧",
+                    "style": "gateway",
+                })
+
+                # 6. Gateway → Agent (tool result)
+                tool_result = _find_tool_result_in_runtime(runtime_conversation, tool.get("tool_use_id"))
+                status_icon = "✅" if tool["status"] == "success" else "❌"
+                gw_status = gw.get("status", "")
+                gw_dur = gw.get("duration_ms", "")
+                meta_line = f"_Status: {status_icon} {tool['status']} | Tool span: {tool['duration_ms']}ms"
+                if gw_status:
+                    meta_line += f" | HTTP {gw_status}"
+                if gw_dur:
+                    meta_line += f" | Gateway: {gw_dur}ms"
+                meta_line += "_"
+                steps.append({
+                    "timestamp": ts,
+                    "step": "gateway_to_agent",
+                    "title": f"6️⃣ Gateway → Agent (result)",
+                    "content": (
+                        (f"```json\n{tool_result}\n```\n" if tool_result else "")
+                        + meta_line
+                    ),
+                    "icon": status_icon,
+                    "style": "tool_result" if tool["status"] == "success" else "error",
+                })
+
+                if rnd.get("errors"):
+                    for err in rnd["errors"]:
+                        steps.append({
+                            "timestamp": ts,
+                            "step": "tool_error",
+                            "title": "⚠️ Tool Error",
+                            "content": err,
+                            "icon": "❌",
+                            "style": "error",
+                        })
+
+        # 9. Agent → User
+        agent_text = assistant_turns[idx]["content"] if idx < len(assistant_turns) else ""
+        if agent_text:
+            steps.append({
+                "timestamp": assistant_turns[idx]["timestamp"] if idx < len(assistant_turns) else ts,
+                "step": "agent_to_user",
+                "title": "9️⃣ Agent → User",
+                "content": agent_text,
+                "icon": "🤖",
+                "style": "assistant",
+            })
+
+        # Per-invocation summary
+        steps.append({
+            "timestamp": ts,
+            "step": "summary",
+            "title": f"⏱️ Invocation {idx + 1}/{len(invocations)}: {inv['duration_ms']}ms",
+            "content": (
+                f"Model: {inv['model'] or '?'} | "
+                f"Tokens: {inv['input_tokens']} in → {inv['output_tokens']} out | "
+                f"Rounds: {len(inv['rounds'])} | "
+                f"Tools used: {sum(1 for r in inv['rounds'] if r['tool'])}"
+            ),
+            "icon": "📊",
+            "style": "summary",
+        })
+
+    return steps
+
+
+def _find_tool_input_in_runtime(runtime_conversation, tool_use_id, tool_name):
+    """Look up the JSON input for a tool from the runtime-log conversation rows."""
+    if not runtime_conversation:
+        return ""
+    # Prefer match by tool_use_id (set on tool_call rows after parser changes)
+    if tool_use_id:
+        for s in runtime_conversation:
+            if s.get("style") == "tool_call" and s.get("tool_use_id") == tool_use_id:
+                return _extract_json_block(s.get("content", ""))
+    # Fallback: match by tool name in the title
+    for s in runtime_conversation:
+        if s.get("style") == "tool_call" and tool_name and tool_name in s.get("title", ""):
+            return _extract_json_block(s.get("content", ""))
+    return ""
+
+
+def _find_tool_result_in_runtime(runtime_conversation, tool_use_id):
+    """Look up the result content (truncated) for a tool from runtime-log conversation rows."""
+    if not runtime_conversation or not tool_use_id:
+        return ""
+    for s in runtime_conversation:
+        if s.get("style") in ("tool_result", "error") and s.get("tool_use_id") == tool_use_id:
+            content = s.get("content", "")
+            if len(content) > 1500:
+                content = content[:1500] + "\n... (truncated)"
+            return content
+    return ""
+
+
+def _extract_json_block(markdown_text):
+    """Pull the JSON inside the first ```json ... ``` fence."""
+    m = re.search(r"```json\s*\n(.*?)\n```", markdown_text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
 def build_clean_narrative(spans, event_messages):
     """
     Build a clean, step-by-step narrative combining spans and events.
@@ -1288,7 +1908,7 @@ def build_clean_narrative(spans, event_messages):
                 tools_raw = attrs.get("gen_ai.agent.tools", "[]")
                 try:
                     tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-                except:
+                except Exception:
                     tools = []
                 tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
 
@@ -1320,7 +1940,7 @@ def build_clean_narrative(spans, event_messages):
                 tools_raw = attrs.get("gen_ai.agent.tools", "[]")
                 try:
                     tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-                except:
+                except Exception:
                     tools = []
                 tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
 
@@ -1805,7 +2425,7 @@ def load_llm_interactions_from_spans(region, session_id, start_time, end_time):
             tools_raw = attrs.get("gen_ai.agent.tools", "[]")
             try:
                 tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-            except:
+            except Exception:
                 tools = []
             tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
 
@@ -1988,7 +2608,7 @@ def build_conversation_from_spans(spans):
             tools_raw = attrs.get("gen_ai.agent.tools", "[]")
             try:
                 tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
-            except:
+            except Exception:
                 tools = []
             # Clean tool names (remove gateway prefix)
             tool_names = [t.split("___")[-1] if "___" in t else t for t in tools]
@@ -2018,7 +2638,7 @@ def build_conversation_from_spans(spans):
                 "timestamp": timestamp,
                 "role": "assistant",
                 "content": (
-                    f"� Thinking... ({model})\n"
+                    f"🧠 Thinking... ({model})\n"
                     f"Generated {output_tokens} tokens in {duration_ms}ms"
                     + (f" (TTFT: {ttft}ms)" if ttft else "")
                 ),
