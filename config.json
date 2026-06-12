@@ -3,7 +3,7 @@
     "us-west-2",
     "us-east-1"
   ],
-  "default_region": "us-west-2",
+  "default_region": "us-east-1",
   "default_time_range": "86400",
   "log_groups": {
     "spans": "aws/spans",
