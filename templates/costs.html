@@ -51,6 +51,7 @@
         .dim-item .name { color: #2d3748; font-weight: 500; }
         .dim-item .cost { color: #2b6cb0; font-weight: 600; font-family: 'SF Mono', monospace; }
         .dim-row { background: #f7fafc; padding: 10px 16px !important; }
+        .dim-row.collapsed { display: none; }
         .agent-dim-section { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
         .agent-dim-section:last-child { margin-bottom: 0; }
         .dim-label { font-size: 0.7rem; color: #718096; font-weight: 600; text-transform: uppercase; min-width: 60px; }
@@ -59,6 +60,18 @@
             padding: 2px 8px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px;
         }
         .dim-cost { color: #2b6cb0; font-weight: 600; font-family: 'SF Mono', monospace; font-size: 0.68rem; }
+        .dim-toggle {
+            background: none; border: 1px solid #e2e8f0; border-radius: 4px;
+            cursor: pointer; padding: 2px 8px; font-size: 0.72rem; color: #4a5568;
+            display: inline-flex; align-items: center; gap: 4px; transition: all 0.15s;
+        }
+        .dim-toggle:hover { border-color: #4299e1; color: #4299e1; background: #ebf8ff; }
+        .dim-toggle .caret { display: inline-block; transition: transform 0.15s; font-size: 0.65rem; }
+        .dim-toggle.open .caret { transform: rotate(90deg); }
+        .dim-toggle .count {
+            background: #edf2f7; color: #4a5568; padding: 0 6px; border-radius: 8px;
+            font-size: 0.65rem; font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -199,17 +212,29 @@
             document.getElementById("tableCount").textContent = `${sorted.length} agents`;
             document.getElementById("costTableBody").innerHTML = `
                 <table>
-                    <thead><tr><th>Agent</th><th>Models</th><th>Sessions</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th><th></th></tr></thead>
+                    <thead><tr><th>Agent</th><th>Models</th><th>Sessions</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th><th>Dimensions</th><th></th></tr></thead>
                     <tbody>
-                        ${sorted.map(([name, d]) => {
+                        ${sorted.map(([name, d], idx) => {
                             const dims = d.dimensions || {};
-                            const dimHtml = Object.entries(dims).map(([dimName, values]) => {
+                            const dimNames = Object.keys(dims);
+                            const dimValueCount = dimNames.reduce((acc, dn) => acc + Object.keys(dims[dn]).length, 0);
+                            const rowId = `agent-dim-${idx}`;
+
+                            const dimHtml = dimNames.map(dimName => {
+                                const values = dims[dimName];
                                 const sortedVals = Object.entries(values).sort((a, b) => b[1].cost - a[1].cost);
                                 return `<div class="agent-dim-section">
                                     <span class="dim-label">${dimName}:</span>
                                     ${sortedVals.map(([val, info]) => `<span class="dim-tag">${val} <span class="dim-cost">$${info.cost.toFixed(4)}</span></span>`).join('')}
                                 </div>`;
                             }).join('');
+
+                            const toggleHtml = dimNames.length > 0
+                                ? `<button class="dim-toggle" onclick="toggleAgentDims('${rowId}', this)">
+                                       <span class="caret">▶</span> View
+                                       <span class="count">${dimValueCount}</span>
+                                   </button>`
+                                : `<span style="font-size:0.7rem;color:#a0aec0">—</span>`;
 
                             return `
                                 <tr>
@@ -220,13 +245,28 @@
                                     <td class="right">${formatNumber(d.input_tokens)}</td>
                                     <td class="right">${formatNumber(d.output_tokens)}</td>
                                     <td class="right"><strong>$${d.cost.toFixed(4)}</strong></td>
+                                    <td>${toggleHtml}</td>
                                     <td style="width:100px"><div class="cost-bar" style="width:${(d.cost/maxCost)*100}%"></div></td>
                                 </tr>
-                                ${dimHtml ? `<tr><td colspan="8" class="dim-row">${dimHtml}</td></tr>` : ''}
+                                ${dimHtml ? `<tr id="${rowId}" class="dim-row collapsed"><td colspan="9">${dimHtml}</td></tr>` : ''}
                             `;
                         }).join('')}
                     </tbody>
                 </table>`;
+        }
+
+        function toggleAgentDims(rowId, btn) {
+            const row = document.getElementById(rowId);
+            if (!row) return;
+            const isCollapsed = row.classList.toggle('collapsed');
+            btn.classList.toggle('open', !isCollapsed);
+            // Replace the "View"/"Hide" text node (the first non-empty text node in the button)
+            for (const node of btn.childNodes) {
+                if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+                    node.textContent = isCollapsed ? ' View ' : ' Hide ';
+                    break;
+                }
+            }
         }
 
         function renderByModel() {
