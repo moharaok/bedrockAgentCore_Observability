@@ -1,8 +1,42 @@
 let agents = [];
 let selectedAgent = null;
 
+// --- Time Range & Region Persistence ---
+function saveTimeRange() {
+    localStorage.setItem('agentcore_time_range', document.getElementById("timeRange").value);
+}
+function restoreTimeRange() {
+    const saved = localStorage.getItem('agentcore_time_range');
+    if (saved) {
+        document.getElementById("timeRange").value = saved;
+    }
+}
+function saveRegion() {
+    localStorage.setItem('agentcore_region', document.getElementById("regionSelect").value);
+}
+function getSelectedRegion() {
+    return document.getElementById("regionSelect").value || 'us-east-1';
+}
+async function initRegions() {
+    const res = await fetch('/api/config');
+    const data = await res.json();
+    const regions = data.regions || ['us-east-1'];
+    const defaultRegion = data.default_region || regions[0];
+    const defaultTimeRange = data.default_time_range || '86400';
+    const select = document.getElementById("regionSelect");
+    select.innerHTML = regions.map(r => `<option value="${r}">${r}</option>`).join('');
+    const savedRegion = localStorage.getItem('agentcore_region');
+    select.value = (savedRegion && regions.includes(savedRegion)) ? savedRegion : defaultRegion;
+    const savedTime = localStorage.getItem('agentcore_time_range');
+    if (!savedTime) {
+        document.getElementById("timeRange").value = defaultTimeRange;
+    }
+}
+
 // --- Init ---
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+    restoreTimeRange();
+    await initRegions();
     loadAgents();
 });
 
@@ -23,7 +57,7 @@ async function loadAgents() {
     listEl.innerHTML = '<div class="loading"><div class="spinner"></div><span>Loading agents...</span></div>';
 
     try {
-        const res = await fetch("/api/agents");
+        const res = await fetch(`/api/agents?region=${getSelectedRegion()}`);
         const data = await res.json();
         agents = data.agents || [];
         document.getElementById("agentCount").textContent = agents.length;
@@ -168,13 +202,15 @@ function renderSessions(sessions, agentName) {
     }
 
     const rows = sessions.map(s => {
-        const sessionLink = s.sessionId
-            ? `<a href="#" class="session-link" onclick="openSessionDetail('${s.sessionId}', '${s.service}'); return false;">${s.sessionId}</a>`
+        const sid = s.sessionId || "";
+        const svc = s.service || "";
+        const sessionLink = sid
+            ? `<a href="#" class="session-link" onclick="openSessionDetail('${sid.replace(/'/g, "\\'")}', '${svc.replace(/'/g, "\\'")}'); return false;">${sid}</a>`
             : "—";
         return `
             <tr>
                 <td class="mono">${sessionLink}</td>
-                <td>${s.service || ""}</td>
+                <td>${svc}</td>
                 <td class="center">${s.spanCount || ""}</td>
                 <td>${s.firstSeen || ""}</td>
                 <td>${s.lastSeen || ""}</td>
@@ -285,7 +321,7 @@ async function loadMetricsTab(sessionId, service) {
     const seconds = document.getElementById("timeRange").value;
     const endTime = Math.floor(Date.now() / 1000);
     const startTime = endTime - parseInt(seconds);
-    const region = selectedAgent ? selectedAgent.region : "us-east-1";
+    const region = selectedAgent ? selectedAgent.region : getSelectedRegion();
 
     try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/metrics?region=${region}&startTime=${startTime}&endTime=${endTime}`);
@@ -477,7 +513,7 @@ async function loadSpansTab(sessionId, service) {
     const seconds = document.getElementById("timeRange").value;
     const endTime = Math.floor(Date.now() / 1000);
     const startTime = endTime - parseInt(seconds);
-    const region = selectedAgent ? selectedAgent.region : "us-east-1";
+    const region = selectedAgent ? selectedAgent.region : getSelectedRegion();
 
     try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/spans?region=${region}&startTime=${startTime}&endTime=${endTime}`);
@@ -495,7 +531,7 @@ async function loadConversationTab(sessionId, service) {
     const seconds = document.getElementById("timeRange").value;
     const endTime = Math.floor(Date.now() / 1000);
     const startTime = endTime - parseInt(seconds);
-    const region = selectedAgent ? selectedAgent.region : "us-east-1";
+    const region = selectedAgent ? selectedAgent.region : getSelectedRegion();
     const agentId = selectedAgent ? selectedAgent.agentRuntimeId : "";
 
     try {

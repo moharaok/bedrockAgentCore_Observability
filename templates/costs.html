@@ -71,7 +71,8 @@
             <a href="/settings"><span class="nav-icon">⚙️</span> Settings</a>
         </nav>
         <div class="time-control">
-            <select id="timeRange" onchange="loadCosts()">
+            <select id="regionSelect" onchange="saveRegion(); loadCosts()"></select>
+            <select id="timeRange" onchange="saveTimeRange(); loadCosts()">
                 <option value="3600">Last 1 Hour</option>
                 <option value="21600">Last 6 Hours</option>
                 <option value="86400">Last 24 Hours</option>
@@ -115,15 +116,54 @@
     </main>
 
     <script>
+        function saveTimeRange() {
+            localStorage.setItem('agentcore_time_range', document.getElementById("timeRange").value);
+        }
+        function restoreTimeRange() {
+            const saved = localStorage.getItem('agentcore_time_range');
+            if (saved) {
+                document.getElementById("timeRange").value = saved;
+            }
+        }
+        function saveRegion() {
+            localStorage.setItem('agentcore_region', document.getElementById("regionSelect").value);
+        }
+        function getSelectedRegion() {
+            return document.getElementById("regionSelect").value || 'us-east-1';
+        }
+        async function initRegions() {
+            const res = await fetch('/api/config');
+            const data = await res.json();
+            const regions = data.regions || ['us-east-1'];
+            const defaultRegion = data.default_region || regions[0];
+            const defaultTimeRange = data.default_time_range || '86400';
+            const select = document.getElementById("regionSelect");
+            select.innerHTML = regions.map(r => `<option value="${r}">${r}</option>`).join('');
+            const savedRegion = localStorage.getItem('agentcore_region');
+            select.value = (savedRegion && regions.includes(savedRegion)) ? savedRegion : defaultRegion;
+            const savedTime = localStorage.getItem('agentcore_time_range');
+            if (!savedTime) {
+                document.getElementById("timeRange").value = defaultTimeRange;
+            }
+        }
+
+        async function init() {
+            restoreTimeRange();
+            await initRegions();
+            loadCosts();
+        }
+        init();
+
         let costData = null;
         let currentView = 'agent';
 
         async function loadCosts() {
             const seconds = document.getElementById("timeRange").value;
+            const region = getSelectedRegion();
             document.getElementById("loading").style.display = "flex";
 
             try {
-                const res = await fetch(`/api/costs?seconds=${seconds}`);
+                const res = await fetch(`/api/costs?seconds=${seconds}&region=${region}`);
                 costData = await res.json();
                 if (costData.error) throw new Error(costData.error);
                 document.getElementById("totalCost").textContent = `$${costData.total_cost.toFixed(4)}`;
@@ -388,7 +428,6 @@
             return n.toString();
         }
 
-        loadCosts();
     </script>
 </body>
 </html>

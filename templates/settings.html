@@ -87,6 +87,22 @@
                     <button onclick="addRegion()">Add</button>
                 </div>
             </div>
+            <div class="form-group">
+                <label>Default Region</label>
+                <select id="defaultRegion"></select>
+                <div class="help">Region selected by default when the dashboard loads</div>
+            </div>
+            <div class="form-group">
+                <label>Default Time Range</label>
+                <select id="defaultTimeRange">
+                    <option value="3600">Last 1 Hour</option>
+                    <option value="21600">Last 6 Hours</option>
+                    <option value="86400">Last 24 Hours</option>
+                    <option value="604800">Last 7 Days</option>
+                    <option value="2592000">Last 30 Days</option>
+                </select>
+                <div class="help">Time range selected by default when the dashboard loads</div>
+            </div>
         </div>
 
         <hr class="divider">
@@ -98,11 +114,7 @@
                 <input type="text" id="lgSpans" value="">
                 <div class="help">Log group containing OTEL span data from agent runtimes</div>
             </div>
-            <div class="form-group">
-                <label>Model Invocation Logs (with content)</label>
-                <input type="text" id="lgModelInvocation" value="">
-                <div class="help">Log group with full LLM request/response bodies (requires content logging enabled)</div>
-            </div>
+
             <div class="form-group">
                 <label>Runtime Logs Prefix</label>
                 <input type="text" id="lgRuntimePrefix" value="">
@@ -171,12 +183,19 @@
             config = await res.json();
             regions = config.regions || ["us-east-1"];
             renderRegions();
+            renderDefaultRegionDropdown();
+            document.getElementById("defaultTimeRange").value = config.default_time_range || "86400";
             document.getElementById("lgSpans").value = config.log_groups?.spans || "aws/spans";
-            document.getElementById("lgModelInvocation").value = config.log_groups?.model_invocation || "";
             document.getElementById("lgRuntimePrefix").value = config.log_groups?.runtime_prefix || "/aws/bedrock-agentcore/runtimes";
             document.getElementById("pricingUrl").value = config.pricing_source || "https://aws.amazon.com/bedrock/pricing/";
             document.getElementById("pricingDate").value = config.pricing_last_updated || "";
             await loadPricingTable();
+        }
+
+        function renderDefaultRegionDropdown() {
+            const select = document.getElementById("defaultRegion");
+            select.innerHTML = regions.map(r => `<option value="${r}">${r}</option>`).join("");
+            select.value = config.default_region || regions[0] || "us-east-1";
         }
 
         function renderRegions() {
@@ -192,6 +211,7 @@
             if (region && !regions.includes(region)) {
                 regions.push(region);
                 renderRegions();
+                renderDefaultRegionDropdown();
                 input.value = "";
             }
         }
@@ -199,6 +219,7 @@
         function removeRegion(region) {
             regions = regions.filter(r => r !== region);
             renderRegions();
+            renderDefaultRegionDropdown();
         }
 
         async function saveSettings() {
@@ -208,9 +229,10 @@
 
             const payload = {
                 regions: regions,
+                default_region: document.getElementById("defaultRegion").value,
+                default_time_range: document.getElementById("defaultTimeRange").value,
                 log_groups: {
                     spans: document.getElementById("lgSpans").value.trim(),
-                    model_invocation: document.getElementById("lgModelInvocation").value.trim(),
                     runtime_prefix: document.getElementById("lgRuntimePrefix").value.trim(),
                 },
                 pricing: {

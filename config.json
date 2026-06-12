@@ -1,10 +1,12 @@
 {
   "regions": [
+    "us-west-2",
     "us-east-1"
   ],
+  "default_region": "us-west-2",
+  "default_time_range": "86400",
   "log_groups": {
     "spans": "aws/spans",
-    "model_invocation": "/aws/bedrock/model-invocation-logs-ai-governance-config-packs",
     "runtime_prefix": "/aws/bedrock-agentcore/runtimes"
   },
   "pricing": {

@@ -68,6 +68,8 @@ def get_config():
     """Return non-sensitive config for the frontend."""
     return jsonify({
         "regions": CONFIGURED_REGIONS,
+        "default_region": CONFIG.get("default_region", CONFIGURED_REGIONS[0] if CONFIGURED_REGIONS else "us-east-1"),
+        "default_time_range": CONFIG.get("default_time_range", "86400"),
         "log_groups": LOG_GROUPS,
         "pricing_source": PRICING_CONFIG.get("source_url", ""),
         "pricing_last_updated": PRICING_CONFIG.get("last_updated", ""),
@@ -83,6 +85,8 @@ def save_config():
         new_config = request.json
         # Merge with existing config
         CONFIG["regions"] = new_config.get("regions", CONFIG.get("regions", []))
+        CONFIG["default_region"] = new_config.get("default_region", CONFIG.get("default_region", ""))
+        CONFIG["default_time_range"] = new_config.get("default_time_range", CONFIG.get("default_time_range", "86400"))
         CONFIG["log_groups"] = new_config.get("log_groups", CONFIG.get("log_groups", {}))
         if "pricing" in new_config:
             CONFIG["pricing"]["source_url"] = new_config["pricing"].get("source_url", CONFIG["pricing"].get("source_url", ""))
@@ -284,11 +288,12 @@ def delete_model_pricing(model_id):
 def get_summary():
     """Aggregate metrics across all agents for the landing page."""
     seconds = int(request.args.get("seconds", 86400))  # Default: last 24h
+    region = request.args.get("region", CONFIGURED_REGIONS[0])
     end_time = int(time.time())
     start_time = end_time - seconds
 
     try:
-        client = boto3.client("logs", region_name=CONFIGURED_REGIONS[0])
+        client = boto3.client("logs", region_name=region)
 
         # Query aws/spans for aggregate metrics
         query = """
@@ -328,19 +333,18 @@ def get_summary():
 
         # Also get total agents count
         all_agents = []
-        for region in CONFIGURED_REGIONS:
-            try:
-                ctrl = boto3.client("bedrock-agentcore-control", region_name=region)
-                paginator = ctrl.get_paginator("list_agent_runtimes")
-                for page in paginator.paginate():
-                    for agent in page.get("agentRuntimes", []):
-                        all_agents.append({
-                            "name": agent.get("agentRuntimeName", ""),
-                            "status": agent.get("status", ""),
-                            "region": region,
-                        })
-            except Exception:
-                pass
+        try:
+            ctrl = boto3.client("bedrock-agentcore-control", region_name=region)
+            paginator = ctrl.get_paginator("list_agent_runtimes")
+            for page in paginator.paginate():
+                for agent in page.get("agentRuntimes", []):
+                    all_agents.append({
+                        "name": agent.get("agentRuntimeName", ""),
+                        "status": agent.get("status", ""),
+                        "region": region,
+                    })
+        except Exception:
+            pass
 
         # Process span results into summary
         total_input_tokens = 0
@@ -473,11 +477,12 @@ def get_summary():
 def get_costs():
     """Get detailed cost breakdown with multiple dimensions."""
     seconds = int(request.args.get("seconds", 86400))
+    region = request.args.get("region", CONFIGURED_REGIONS[0])
     end_time = int(time.time())
     start_time = end_time - seconds
 
     try:
-        client = boto3.client("logs", region_name=CONFIGURED_REGIONS[0])
+        client = boto3.client("logs", region_name=region)
 
         # Query spans with all dimensions we need
         query = """
@@ -581,14 +586,14 @@ def get_costs():
             by_model[model]["cost"] += total_cost
             by_model[model]["agents"].add(service)
 
-            # By Region (all data is from configured regions)
-            region = CONFIGURED_REGIONS[0]
-            if region not in by_region:
-                by_region[region] = {"input_tokens": 0, "output_tokens": 0, "calls": 0, "cost": 0, "agents": set()}
-            by_region[region]["input_tokens"] += input_tokens
-            by_region[region]["output_tokens"] += output_tokens
-            by_region[region]["calls"] += calls
-            by_region[region]["cost"] += total_cost
+            # By Region (all data is from the selected region)
+            query_region = region
+            if query_region not in by_region:
+                by_region[query_region] = {"input_tokens": 0, "output_tokens": 0, "calls": 0, "cost": 0, "agents": set()}
+            by_region[query_region]["input_tokens"] += input_tokens
+            by_region[query_region]["output_tokens"] += output_tokens
+            by_region[query_region]["calls"] += calls
+            by_region[query_region]["cost"] += total_cost
             by_region[region]["agents"].add(service)
 
             # By Session (full)
@@ -674,22 +679,22 @@ def is_uuid_part(s):
 
 @app.route("/api/agents")
 def list_agents():
+    region = request.args.get("region", CONFIGURED_REGIONS[0])
     all_agents = []
-    for region in CONFIGURED_REGIONS:
-        try:
-            client = boto3.client("bedrock-agentcore-control", region_name=region)
-            paginator = client.get_paginator("list_agent_runtimes")
-            for page in paginator.paginate():
-                for agent in page.get("agentRuntimes", []):
-                    agent["region"] = region
-                    # Convert datetime to string
-                    if "lastUpdatedAt" in agent:
-                        agent["lastUpdatedAt"] = agent["lastUpdatedAt"].isoformat()
-                    if "createdAt" in agent:
-                        agent["createdAt"] = agent["createdAt"].isoformat()
-                    all_agents.append(agent)
-        except Exception as e:
-            print(f"Error listing agents in {region}: {e}")
+    try:
+        client = boto3.client("bedrock-agentcore-control", region_name=region)
+        paginator = client.get_paginator("list_agent_runtimes")
+        for page in paginator.paginate():
+            for agent in page.get("agentRuntimes", []):
+                agent["region"] = region
+                # Convert datetime to string
+                if "lastUpdatedAt" in agent:
+                    agent["lastUpdatedAt"] = agent["lastUpdatedAt"].isoformat()
+                if "createdAt" in agent:
+                    agent["createdAt"] = agent["createdAt"].isoformat()
+                all_agents.append(agent)
+    except Exception as e:
+        print(f"Error listing agents in {region}: {e}")
     return jsonify({"agents": all_agents})
 
 
@@ -731,6 +736,7 @@ def get_sessions():
             | parse @message /\"aws.span.kind\":\"(?<spanKind>[^\"]+)\"/
             | filter (spanKind = 'LOCAL_ROOT' or @message like /"name":"invoke_agent/)
             | filter ispresent(service)
+            | filter ispresent(sessionId)
             {filter_clause}
             | stats count(*) as spanCount, min(@timestamp) as firstSeen, max(@timestamp) as lastSeen by service, sessionId
             | sort lastSeen desc
@@ -777,7 +783,8 @@ def get_session_conversation(session_id):
 
     try:
         # Extract actor_id from session_id pattern
-        actor_id = session_id.split("_")[0] if "_" in session_id else ""
+        # Some session IDs use format "actorId_sessionUUID", others are plain UUIDs
+        actor_id = session_id.split("_")[0] if "_" in session_id else session_id
 
         # Get memory_id from agent's environment variables
         memory_id = request.args.get("memoryId", "")
@@ -798,23 +805,21 @@ def get_session_conversation(session_id):
         if memory_id and actor_id:
             event_messages = load_conversation_from_events(region, memory_id, actor_id, session_id)
 
-        # Narrow time window for model invocation logs based on actual span timestamps
-        # This prevents pulling unrelated logs from the full time range
-        llm_start = start_time
-        llm_end = end_time
-        if spans:
-            first_nano = spans[0].get("startTimeUnixNano", 0)
-            last_nano = spans[-1].get("startTimeUnixNano", 0) + spans[-1].get("durationNano", 0)
-            if first_nano:
-                llm_start = int(first_nano / 1_000_000_000) - 5  # 5s buffer
-            if last_nano:
-                llm_end = int(last_nano / 1_000_000_000) + 5
+        # Build clean narrative from spans + events
+        conversation = build_clean_narrative(spans, event_messages)
 
-        # Load model invocation logs (full agent↔LLM messages)
-        llm_conversations = load_model_invocation_logs(region, session_id, llm_start, llm_end)
-
-        # Build clean narrative
-        conversation = build_clean_narrative(spans, event_messages, llm_conversations)
+        # Always try agent runtime logs for the actual conversation content
+        # (spans only give us metadata like model, tokens, duration - not the messages)
+        runtime_conversation = load_conversation_from_runtime_logs(
+            region, agent_id, session_id, start_time, end_time
+        )
+        if runtime_conversation:
+            # If we got runtime logs with user/assistant messages, use them
+            has_content = any(
+                s.get("style") in ("user", "assistant") for s in runtime_conversation
+            )
+            if has_content:
+                conversation = runtime_conversation
 
         return jsonify({
             "conversation": conversation,
@@ -824,93 +829,6 @@ def get_session_conversation(session_id):
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-def load_model_invocation_logs(region, session_id, start_time, end_time):
-    """Load full agent↔LLM conversation from Bedrock model invocation logs.
-    
-    Correlates by time window since model invocation logs don't contain session IDs.
-    Uses the session's span timestamps to find the matching LLM calls.
-    """
-    client = boto3.client("logs", region_name=region)
-
-    query = """
-        fields @timestamp, @message
-        | sort @timestamp asc
-        | limit 100
-    """.strip()
-
-    log_group = LOG_GROUPS.get("model_invocation", "")
-    if not log_group:
-        return []
-
-    try:
-        response = client.start_query(
-            logGroupNames=[log_group],
-            startTime=start_time,
-            endTime=end_time,
-            queryString=query,
-        )
-        query_id = response["queryId"]
-
-        status = "Running"
-        results = []
-        while status in ("Running", "Scheduled"):
-            time.sleep(1)
-            result = client.get_query_results(queryId=query_id)
-            status = result.get("status", "Unknown")
-            results = result.get("results", [])
-
-        invocations = []
-        for row in results:
-            timestamp = ""
-            message = ""
-            for field in row:
-                if field["field"] == "@timestamp":
-                    timestamp = field["value"]
-                elif field["field"] == "@message":
-                    message = field["value"]
-            if message:
-                try:
-                    log_entry = json.loads(message)
-                    body = log_entry.get("input", {}).get("inputBodyJson", {})
-                    out_body = log_entry.get("output", {}).get("outputBodyJson", {})
-
-                    # Extract agent name from identity ARN
-                    # Format: arn:aws:sts::...:assumed-role/<role-name>/BedrockAgentCore-...
-                    identity_arn = log_entry.get("identity", {}).get("arn", "")
-                    agent_label = ""
-                    if identity_arn:
-                        parts = identity_arn.split("/")
-                        if len(parts) >= 2:
-                            role_name = parts[1]  # e.g. "marvin-agentcore-runtime-ExecutionRole605A040B-xxx"
-                            # Extract meaningful name: strip common suffixes
-                            import re
-                            match = re.match(r"(.+?)-?ExecutionRole[^-]*-.*", role_name)
-                            if match:
-                                agent_label = match.group(1)
-                            else:
-                                agent_label = role_name
-
-                    invocations.append({
-                        "timestamp": timestamp,
-                        "model": log_entry.get("modelId", ""),
-                        "operation": log_entry.get("operation", ""),
-                        "input_tokens": log_entry.get("input", {}).get("inputTokenCount", 0),
-                        "output_tokens": log_entry.get("output", {}).get("outputTokenCount", 0),
-                        "system_prompt": body.get("system", []),
-                        "messages": body.get("messages", []),
-                        "llm_output": out_body.get("output", {}).get("message", {}),
-                        "tools_config": body.get("toolConfig", {}),
-                        "agent_label": agent_label,
-                    })
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    continue
-
-        return invocations
-
-    except Exception:
-        return []
 
 
 def load_raw_spans(region, session_id, start_time, end_time):
@@ -960,14 +878,378 @@ def load_raw_spans(region, session_id, start_time, end_time):
     return spans
 
 
-def build_clean_narrative(spans, event_messages, llm_conversations=None):
+def load_conversation_from_runtime_logs(region, agent_id, session_id, start_time, end_time):
+    """Load conversation from agent runtime log group.
+    
+    Agent runtime logs are stored in: /aws/bedrock-agentcore/runtimes/<agentId>-DEFAULT
+    These contain OTEL-formatted logs with the actual user inputs, agent responses,
+    tool calls, and conversation flow emitted by Strands SDK during execution.
+    """
+    if not agent_id:
+        print(f"[runtime_logs] No agent_id provided, skipping")
+        return []
+
+    runtime_prefix = LOG_GROUPS.get("runtime_prefix", "/aws/bedrock-agentcore/runtimes")
+    # Runtime log groups have -DEFAULT appended
+    log_group = f"{runtime_prefix}/{agent_id}-DEFAULT"
+    print(f"[runtime_logs] Querying log group: {log_group} for session: {session_id}")
+
+    client = boto3.client("logs", region_name=region)
+
+    # Query for log entries matching this session
+    query = f"""
+        fields @timestamp, @message
+        | filter @message like /"{session_id}"/
+        | sort @timestamp asc
+        | limit 100
+    """.strip()
+
+    try:
+        response = client.start_query(
+            logGroupNames=[log_group],
+            startTime=start_time,
+            endTime=end_time,
+            queryString=query.strip(),
+        )
+        query_id = response["queryId"]
+
+        status = "Running"
+        results = []
+        while status in ("Running", "Scheduled"):
+            time.sleep(1)
+            result = client.get_query_results(queryId=query_id)
+            status = result.get("status", "Unknown")
+            results = result.get("results", [])
+
+        if not results:
+            # Try without -DEFAULT suffix as fallback
+            log_group_alt = f"{runtime_prefix}/{agent_id}"
+            try:
+                response = client.start_query(
+                    logGroupNames=[log_group_alt],
+                    startTime=start_time,
+                    endTime=end_time,
+                    queryString=query.strip(),
+                )
+                query_id = response["queryId"]
+
+                status = "Running"
+                while status in ("Running", "Scheduled"):
+                    time.sleep(1)
+                    result = client.get_query_results(queryId=query_id)
+                    status = result.get("status", "Unknown")
+                    results = result.get("results", [])
+            except Exception:
+                pass
+
+        if not results:
+            print(f"[runtime_logs] No results found in {log_group}")
+            return []
+
+        # Parse the OTEL runtime log entries into a conversation
+        print(f"[runtime_logs] Found {len(results)} log entries, parsing...")
+        conversation = parse_otel_runtime_logs(results)
+        print(f"[runtime_logs] Parsed into {len(conversation)} conversation steps")
+        return conversation
+
+    except Exception as e:
+        print(f"[runtime_logs] Error loading runtime logs for agent {agent_id}: {e}")
+        return []
+
+
+
+def parse_otel_runtime_logs(results):
+    """Parse OTEL-formatted runtime logs into a conversation timeline.
+    
+    These logs have structure:
+    {
+      "body": {
+        "input": {"messages": [{"role": "user/system/tool", "content": {...}}]},
+        "output": {"messages": [{"role": "assistant", "content": {...}}]}
+      },
+      "attributes": {"session.id": "...", "event.name": "..."},
+      "timeUnixNano": ...
+    }
+    """
+    conversation = []
+    seen_messages = set()  # Deduplicate messages across log entries
+
+    for row in results:
+        timestamp = ""
+        message = ""
+        for field in row:
+            if field["field"] == "@timestamp":
+                timestamp = field["value"]
+            elif field["field"] == "@message":
+                message = field["value"]
+
+        if not message:
+            continue
+
+        try:
+            log_entry = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Handle simple INFO logs (e.g., "Invocation completed successfully")
+        if "body" not in log_entry and "message" in log_entry:
+            msg = log_entry.get("message", "")
+            if msg and "completed" in msg.lower():
+                conversation.append({
+                    "timestamp": timestamp,
+                    "step": "system",
+                    "title": "System",
+                    "content": msg,
+                    "icon": "\u2705",
+                    "style": "log",
+                })
+            continue
+
+        body = log_entry.get("body", {})
+        if not body:
+            continue
+
+        input_msgs = body.get("input", {}).get("messages", [])
+        output_msgs = body.get("output", {}).get("messages", [])
+
+        # Extract user/system messages from input
+        for msg in input_msgs:
+            role = msg.get("role", "")
+            content_raw = msg.get("content", {})
+            text = _extract_message_text(content_raw)
+
+            if not text:
+                continue
+
+            if role == "system":
+                msg_key = f"system:{text[:100]}"
+                if msg_key not in seen_messages:
+                    seen_messages.add(msg_key)
+                    conversation.append({
+                        "timestamp": timestamp,
+                        "step": "system",
+                        "title": "System Prompt",
+                        "content": text,
+                        "icon": "\U0001f4dc",
+                        "style": "system_prompt",
+                    })
+            elif role == "user":
+                msg_key = f"user:{text[:100]}"
+                if msg_key not in seen_messages:
+                    seen_messages.add(msg_key)
+                    conversation.append({
+                        "timestamp": timestamp,
+                        "step": "user",
+                        "title": "User",
+                        "content": text,
+                        "icon": "\U0001f464",
+                        "style": "user",
+                    })
+            elif role == "tool":
+                msg_key = f"tool_input:{text[:100]}"
+                if msg_key not in seen_messages:
+                    seen_messages.add(msg_key)
+                    tool_text = _parse_tool_result_text(text)
+                    conversation.append({
+                        "timestamp": timestamp,
+                        "step": "tool_result",
+                        "title": "Tool Result",
+                        "content": tool_text,
+                        "icon": "\U0001f4e5",
+                        "style": "tool_result",
+                    })
+
+        # Extract assistant responses from output
+        for msg in output_msgs:
+            role = msg.get("role", "")
+            content_raw = msg.get("content", {})
+
+            if role != "assistant":
+                continue
+
+            if isinstance(content_raw, dict):
+                message_text = content_raw.get("message", "")
+                finish_reason = content_raw.get("finish_reason", "")
+
+                if message_text:
+                    parsed = _parse_content_blocks(message_text)
+                    for block in parsed:
+                        if block["type"] == "text":
+                            msg_key = f"assistant:{block['text'][:100]}"
+                            if msg_key not in seen_messages:
+                                seen_messages.add(msg_key)
+                                conversation.append({
+                                    "timestamp": timestamp,
+                                    "step": "assistant",
+                                    "title": "Agent",
+                                    "content": block["text"],
+                                    "icon": "\U0001f916",
+                                    "style": "assistant",
+                                })
+                        elif block["type"] == "tool_use":
+                            msg_key = f"tool_call:{block['name']}:{str(block.get('input', ''))[:50]}"
+                            if msg_key not in seen_messages:
+                                seen_messages.add(msg_key)
+                                tool_input = block.get("input", "")
+                                if isinstance(tool_input, dict):
+                                    tool_input = json.dumps(tool_input)
+                                conversation.append({
+                                    "timestamp": timestamp,
+                                    "step": "tool_call",
+                                    "title": f"Tool: {block['name']}",
+                                    "content": f"**{block['name']}**\n```json\n{tool_input}\n```",
+                                    "icon": "\U0001f527",
+                                    "style": "tool_call",
+                                })
+
+                # Check for tool.result in content
+                tool_result_text = content_raw.get("tool.result", "")
+                if tool_result_text:
+                    parsed_results = _parse_content_blocks(tool_result_text)
+                    for block in parsed_results:
+                        if block["type"] == "tool_result":
+                            msg_key = f"tool_result:{block.get('text', '')[:100]}"
+                            if msg_key not in seen_messages:
+                                seen_messages.add(msg_key)
+                                status_str = block.get("status", "success")
+                                icon = "\u2705" if status_str == "success" else "\u274c"
+                                conversation.append({
+                                    "timestamp": timestamp,
+                                    "step": "tool_result",
+                                    "title": f"Tool Result ({status_str})",
+                                    "content": block.get("text", ""),
+                                    "icon": icon,
+                                    "style": "tool_result",
+                                })
+
+            elif isinstance(content_raw, str):
+                msg_key = f"assistant:{content_raw[:100]}"
+                if msg_key not in seen_messages:
+                    seen_messages.add(msg_key)
+                    conversation.append({
+                        "timestamp": timestamp,
+                        "step": "assistant",
+                        "title": "Agent",
+                        "content": content_raw,
+                        "icon": "\U0001f916",
+                        "style": "assistant",
+                    })
+
+    return conversation
+
+
+def _extract_message_text(content_raw):
+    """Extract readable text from various message content formats."""
+    if isinstance(content_raw, str):
+        try:
+            parsed = json.loads(content_raw)
+            if isinstance(parsed, list):
+                texts = []
+                for item in parsed:
+                    if isinstance(item, dict) and "text" in item:
+                        texts.append(item["text"])
+                return "\n".join(texts) if texts else content_raw
+            return content_raw
+        except (json.JSONDecodeError, TypeError):
+            return content_raw
+    elif isinstance(content_raw, dict):
+        inner = content_raw.get("content", content_raw.get("message", ""))
+        if isinstance(inner, str):
+            try:
+                parsed = json.loads(inner)
+                if isinstance(parsed, list):
+                    texts = []
+                    for item in parsed:
+                        if isinstance(item, dict) and "text" in item:
+                            texts.append(item["text"])
+                    return "\n".join(texts) if texts else inner
+                return inner
+            except (json.JSONDecodeError, TypeError):
+                return inner
+        return str(inner) if inner else ""
+    elif isinstance(content_raw, list):
+        texts = []
+        for item in content_raw:
+            if isinstance(item, dict) and "text" in item:
+                texts.append(item["text"])
+        return "\n".join(texts)
+    return ""
+
+
+def _parse_content_blocks(text):
+    """Parse a JSON array of content blocks into structured items."""
+    if not text:
+        return []
+
+    try:
+        blocks = json.loads(text) if isinstance(text, str) else text
+    except (json.JSONDecodeError, TypeError):
+        return [{"type": "text", "text": text}]
+
+    if not isinstance(blocks, list):
+        return [{"type": "text", "text": str(blocks)}]
+
+    result = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            result.append({"type": "text", "text": str(block)})
+            continue
+
+        if "text" in block:
+            result.append({"type": "text", "text": block["text"]})
+        elif "toolUse" in block:
+            tool_use = block["toolUse"]
+            name = tool_use.get("name", "unknown")
+            display = name.split("___")[-1] if "___" in name else name
+            result.append({
+                "type": "tool_use",
+                "name": display,
+                "input": tool_use.get("input", {}),
+                "toolUseId": tool_use.get("toolUseId", ""),
+            })
+        elif "toolResult" in block:
+            tool_result = block["toolResult"]
+            text_parts = []
+            for c in tool_result.get("content", []):
+                if isinstance(c, dict) and "text" in c:
+                    text_parts.append(c["text"])
+            result.append({
+                "type": "tool_result",
+                "status": tool_result.get("status", "success"),
+                "text": "\n".join(text_parts),
+                "toolUseId": tool_result.get("toolUseId", ""),
+            })
+
+    return result
+
+
+def _parse_tool_result_text(text):
+    """Parse tool result text which may be JSON content blocks."""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, indent=2)
+        elif isinstance(parsed, list):
+            texts = []
+            for item in parsed:
+                if isinstance(item, dict):
+                    if "text" in item:
+                        texts.append(item["text"])
+                    elif "toolResult" in item:
+                        for c in item["toolResult"].get("content", []):
+                            if "text" in c:
+                                texts.append(c["text"])
+            return "\n".join(texts) if texts else text
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return text
+
+
+def build_clean_narrative(spans, event_messages):
     """
     Build a clean, step-by-step narrative combining spans and events.
     Includes: user messages, agent↔LLM exchanges, agent↔gateway calls, tool results.
     """
-    if llm_conversations is None:
-        llm_conversations = []
-
     steps = []
 
     # Parse spans into invocations with detailed sub-steps
@@ -1062,77 +1344,6 @@ def build_clean_narrative(spans, event_messages, llm_conversations=None):
                     "style": "llm",
                     "content": llm_content,
                 })
-
-                # If we have model invocation logs, add the actual messages
-                if llm_conversations:
-                    llm_call_idx = len([s for s in current_invocation["sub_steps"] if s["title"] == "Agent → LLM"]) - 1
-                    # Match by order (first invoke_agent gets first llm_conversation, etc.)
-                    global_invoke_count = sum(
-                        1 for inv in invocations for s in inv.get("sub_steps", []) if s["title"] == "Agent → LLM"
-                    ) + llm_call_idx
-                    if global_invoke_count < len(llm_conversations):
-                        llm_log = llm_conversations[global_invoke_count]
-                        # Add system prompt (first time only)
-                        if llm_log.get("system_prompt") and global_invoke_count == 0:
-                            sys_text = ""
-                            for sp in llm_log["system_prompt"]:
-                                if "text" in sp:
-                                    sys_text += sp["text"]
-                            if sys_text:
-                                current_invocation["sub_steps"].append({
-                                    "icon": "📜",
-                                    "title": "System Prompt",
-                                    "style": "system_prompt",
-                                    "content": sys_text[:2000],
-                                })
-
-                        # Add messages sent to LLM
-                        msgs_summary = []
-                        for m in llm_log.get("messages", []):
-                            role = m.get("role", "")
-                            for c in m.get("content", []):
-                                if "text" in c:
-                                    msgs_summary.append(f"**[{role}]** {c['text'][:300]}")
-                                elif "toolUse" in c:
-                                    tool_name_raw = c["toolUse"].get("name", "")
-                                    display = tool_name_raw.split("___")[-1] if "___" in tool_name_raw else tool_name_raw
-                                    tool_inp = json.dumps(c["toolUse"].get("input", {}))[:200]
-                                    msgs_summary.append(f"**[{role}]** 🔧 `{display}` → {tool_inp}")
-                                elif "toolResult" in c:
-                                    status = c["toolResult"].get("status", "")
-                                    rc_text = ""
-                                    for rc in c["toolResult"].get("content", []):
-                                        if "text" in rc:
-                                            rc_text = rc["text"][:200]
-                                    msgs_summary.append(f"**[{role}]** 📥 Result ({status}): {rc_text}")
-
-                        if msgs_summary:
-                            current_invocation["sub_steps"].append({
-                                "icon": "📨",
-                                "title": f"Messages sent to LLM ({len(llm_log.get('messages', []))} messages)",
-                                "style": "llm_messages",
-                                "content": "\n\n".join(msgs_summary),
-                            })
-
-                        # Add LLM output
-                        llm_output = llm_log.get("llm_output", {})
-                        if llm_output:
-                            out_parts = []
-                            for c in llm_output.get("content", []):
-                                if "text" in c:
-                                    out_parts.append(c["text"][:500])
-                                elif "toolUse" in c:
-                                    tool_name_raw = c["toolUse"].get("name", "")
-                                    display = tool_name_raw.split("___")[-1] if "___" in tool_name_raw else tool_name_raw
-                                    tool_inp = json.dumps(c["toolUse"].get("input", {}))[:300]
-                                    out_parts.append(f"🔧 **LLM decided to call: `{display}`**\n```json\n{tool_inp}\n```")
-                            if out_parts:
-                                current_invocation["sub_steps"].append({
-                                    "icon": "🤖",
-                                    "title": "LLM Response",
-                                    "style": "llm_response",
-                                    "content": "\n\n".join(out_parts),
-                                })
 
             # LLM thinking (chat span with TTFT = the real one)
             elif (name == "chat" or name.startswith("chat ")) and attrs.get("gen_ai.server.time_to_first_token"):
@@ -1377,176 +1588,6 @@ def build_clean_narrative(spans, event_messages, llm_conversations=None):
 
         return steps
 
-    # Fallback: spans + model invocation logs (no event_messages)
-    # Build narrative from model invocation logs and span data
-    if invocations and llm_conversations:
-        # Determine the primary agent (orchestrator) by taking the first log's agent_label
-        primary_agent = llm_conversations[0].get("agent_label", "") if llm_conversations else ""
-
-        for llm_idx, llm_log in enumerate(llm_conversations):
-            agent_label = llm_log.get("agent_label", "")
-            is_sub_agent = agent_label and primary_agent and agent_label != primary_agent
-
-            # Sub-agent header (only show when transitioning from primary to sub-agent)
-            if is_sub_agent:
-                prev_agent = llm_conversations[llm_idx - 1].get("agent_label", "") if llm_idx > 0 else primary_agent
-                if prev_agent == primary_agent or prev_agent != agent_label:
-                    # Derive a friendly sub-agent name
-                    sub_name = agent_label.replace("marvin-agentcore-", "").replace("-", " ").title()
-                    steps.append({
-                        "timestamp": llm_log.get("timestamp", ""),
-                        "step": "sub_agent_start",
-                        "title": f"↳ Sub-agent: {sub_name}",
-                        "content": f"Orchestrator delegated to **{sub_name}**",
-                        "icon": "🔀",
-                        "style": "gateway",
-                        "agent_label": agent_label,
-                    })
-
-            # Extract user message from the first 'user' role message
-            user_text = ""
-            for m in llm_log.get("messages", []):
-                if m.get("role") == "user":
-                    for c in m.get("content", []):
-                        if "text" in c:
-                            user_text = c["text"]
-                            break
-                    if user_text:
-                        break
-
-            if user_text:
-                title = "User" if not is_sub_agent else f"↳ Input to {agent_label.replace('marvin-agentcore-', '').replace('-', ' ').title()}"
-                steps.append({
-                    "timestamp": llm_log.get("timestamp", ""),
-                    "step": "user_message",
-                    "title": title,
-                    "content": user_text,
-                    "icon": "👤" if not is_sub_agent else "📨",
-                    "style": "user" if not is_sub_agent else "llm_messages",
-                    "agent_label": agent_label,
-                })
-
-            # Add system prompt on first invocation per agent
-            if llm_log.get("system_prompt"):
-                # Only show system prompt for the first occurrence of each agent
-                shown_prompts = [s.get("agent_label") for s in steps if s.get("step") == "system_prompt"]
-                if agent_label not in shown_prompts:
-                    sys_text = ""
-                    for sp in llm_log["system_prompt"]:
-                        if "text" in sp:
-                            sys_text += sp["text"]
-                    if sys_text:
-                        steps.append({
-                            "timestamp": llm_log.get("timestamp", ""),
-                            "step": "system_prompt",
-                            "title": "System Prompt" if not is_sub_agent else f"↳ System Prompt ({agent_label.replace('marvin-agentcore-', '').replace('-', ' ').title()})",
-                            "content": sys_text[:2000],
-                            "icon": "📜",
-                            "style": "system_prompt",
-                            "agent_label": agent_label,
-                        })
-
-            # Add span sub-steps if available for this invocation
-            if llm_idx < len(invocations):
-                inv = invocations[llm_idx]
-                for sub in inv["sub_steps"]:
-                    step_entry = {
-                        "timestamp": inv["timestamp"],
-                        "step": sub.get("title", ""),
-                        "title": f"↳ {sub['title']}" if is_sub_agent else sub["title"],
-                        "content": sub["content"],
-                        "icon": sub["icon"],
-                        "style": sub["style"],
-                    }
-                    steps.append(step_entry)
-
-            # Add tool calls and results from messages
-            for m in llm_log.get("messages", []):
-                role = m.get("role", "")
-                for c in m.get("content", []):
-                    if "toolUse" in c and role == "assistant":
-                        tool_name_raw = c["toolUse"].get("name", "")
-                        display = tool_name_raw.split("___")[-1] if "___" in tool_name_raw else tool_name_raw
-                        tool_inp = json.dumps(c["toolUse"].get("input", {}))[:500]
-                        steps.append({
-                            "timestamp": llm_log.get("timestamp", ""),
-                            "step": "tool_call",
-                            "title": f"{'↳ ' if is_sub_agent else ''}LLM decided: call '{display}'",
-                            "content": f"**{display}**\n```json\n{tool_inp}\n```",
-                            "icon": "🔧",
-                            "style": "tool_call",
-                        })
-                    elif "toolResult" in c and role == "user":
-                        status = c["toolResult"].get("status", "success")
-                        rc_text = ""
-                        for rc in c["toolResult"].get("content", []):
-                            if "text" in rc:
-                                rc_text = rc["text"][:500]
-                        steps.append({
-                            "timestamp": llm_log.get("timestamp", ""),
-                            "step": "tool_result",
-                            "title": f"{'↳ ' if is_sub_agent else ''}Tool response ({status})",
-                            "content": rc_text,
-                            "icon": "📥" if status != "error" else "❌",
-                            "style": "tool_result" if status != "error" else "error",
-                        })
-
-            # Add LLM output (assistant response)
-            llm_output = llm_log.get("llm_output", {})
-            if llm_output:
-                for c in llm_output.get("content", []):
-                    if "text" in c:
-                        steps.append({
-                            "timestamp": llm_log.get("timestamp", ""),
-                            "step": "agent_response",
-                            "title": f"{'↳ ' if is_sub_agent else ''}Agent → User",
-                            "content": c["text"],
-                            "icon": "🤖",
-                            "style": "assistant",
-                        })
-                    elif "toolUse" in c:
-                        tool_name_raw = c["toolUse"].get("name", "")
-                        display = tool_name_raw.split("___")[-1] if "___" in tool_name_raw else tool_name_raw
-                        tool_inp = json.dumps(c["toolUse"].get("input", {}))[:500]
-                        steps.append({
-                            "timestamp": llm_log.get("timestamp", ""),
-                            "step": "tool_call",
-                            "title": f"{'↳ ' if is_sub_agent else ''}LLM decided: call '{display}'",
-                            "content": f"**{display}**\n```json\n{tool_inp}\n```",
-                            "icon": "🔧",
-                            "style": "tool_call",
-                        })
-
-            # Sub-agent end marker
-            if is_sub_agent:
-                # Check if the next log is back to primary agent
-                next_is_primary = (llm_idx + 1 < len(llm_conversations) and
-                                   llm_conversations[llm_idx + 1].get("agent_label", "") == primary_agent)
-                if next_is_primary or llm_idx == len(llm_conversations) - 1:
-                    steps.append({
-                        "timestamp": llm_log.get("timestamp", ""),
-                        "step": "sub_agent_end",
-                        "title": f"↳ Sub-agent complete",
-                        "content": f"Returning result to orchestrator",
-                        "icon": "↩️",
-                        "style": "gateway",
-                    })
-            else:
-                # Add summary for orchestrator invocations
-                if llm_idx < len(invocations):
-                    inv = invocations[llm_idx]
-                    steps.append({
-                        "timestamp": inv["timestamp"],
-                        "step": "summary",
-                        "title": f"⏱️ Total: {inv['total_duration_ms']}ms",
-                        "content": f"Model: {inv.get('model','unknown')} | Tokens: {inv.get('input_tokens', '?')} in → {inv.get('output_tokens', '?')} out",
-                        "icon": "📊",
-                        "style": "summary",
-                    })
-
-        return steps
-
-    # Fallback: spans only (no model invocation logs either)
     if invocations:
         for inv in invocations:
             for sub in inv["sub_steps"]:
